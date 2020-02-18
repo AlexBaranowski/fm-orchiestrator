@@ -83,7 +83,7 @@ PGSQL
 
 Vagrant.configure("2") do |config|
   config.vm.box = "fedora/31-cloud-base"
-  config.vm.synced_folder "./", "/opt/module_build_service"
+  config.vm.synced_folder "./", "/opt/module_build_service", type: "rsync"
   # Disable the default share
   config.vm.synced_folder ".", "/vagrant", disabled: true
   config.vm.network "forwarded_port", guest_ip: "0.0.0.0", guest: 5000, host: 5000
@@ -91,11 +91,9 @@ Vagrant.configure("2") do |config|
   config.vm.provision "shell", inline: "usermod -a -G mock vagrant"
   config.vm.provision "shell", inline: $config_pgsql
   config.vm.provision "shell", inline: $make_devenv, privileged: false
+  # 4096 and 4 cpu should be enough to build most packages
   config.vm.provider "libvirt" do |v, override|
-    override.vm.synced_folder "./", "/opt/module_build_service", type: "sshfs"
-    v.memory = 1024
-  end
-  config.vm.provider "virtualbox" do |v|
-    v.memory = 1024
+    v.memory = 4096
+    v.cpus = 4
   end
 end
