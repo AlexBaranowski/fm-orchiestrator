@@ -31,7 +31,7 @@ ENV HOME=${HOME_DIR} \
 USER root
 
 RUN ${DNF_CMD} install -y \
-    java-1.8.0-openjdk nss_wrapper gettext git \
+    java-1.8.0-openjdk nss_wrapper gettext git jq \
     tar gzip skopeo wget make bind-utils python3-jinja2-cli \
     origin-clients \
     # Jenkins pipeline 'sh' steps seem to require ps

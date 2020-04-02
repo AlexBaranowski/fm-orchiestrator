@@ -18,7 +18,7 @@ data:
   dependencies:
     buildrequires: {}
     requires: {}
-  description: Fedora 28 traditional base
+  description: Fedora 30 traditional base
   license:
     module: [MIT]
   name: platform
@@ -35,6 +35,7 @@ data:
   stream: f28
   summary: A test module in all its beautiful beauty
   version: 3
+  context: 00000000
   xmd:
     mbs:
       buildrequires:

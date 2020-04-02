@@ -8,7 +8,7 @@ data:
           dependency of mksh., ref: master, repository: 'https://src.fedoraproject.org/rpms/ed'}
   dependencies:
     buildrequires: {testmodule: master}
-    requires: {platform: f28}
+    requires: {platform: f30}
   description: This module demonstrates how to write simple modulemd files And can
     be used for testing the build and release pipeline.
   license:
@@ -28,7 +28,7 @@ data:
         testmodule: {ref: 147dca4ca65aa9a1ac51f71b7e687f9178ffa5df, stream: master,
           version: '20170616125652', context: '321'}
       requires:
-        platform: {ref: virtual, stream: f28, version: '3', context: '00000000'}
+        platform: {ref: virtual, stream: f30, version: '3', context: '00000000'}
       commit: 722fd739fd6cf66faf29f6fb95dd64f60ba3e39a
       rpms:
         ed: {ref: 01bf8330812fea798671925cc537f2f29b0bd216}

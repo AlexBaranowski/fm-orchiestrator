@@ -1,28 +1,41 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
-from __future__ import print_function
-from flask_script import Manager, prompt_bool
+from __future__ import absolute_import, print_function
 from functools import wraps
-import flask_migrate
+import getpass
 import logging
 import os
-import getpass
 import textwrap
 
+import flask_migrate
+from flask_script import Manager, prompt_bool
 from werkzeug.datastructures import FileStorage
-from module_build_service import app, conf, db, create_app
-from module_build_service import models
-from module_build_service.utils import (
-    submit_module_build_from_yaml,
-    load_local_builds,
-    load_mmd_file,
-    import_mmd,
-    import_builds_from_local_dnf_repos,
+
+from module_build_service import app, db
+from module_build_service.builder.MockModuleBuilder import (
+    import_builds_from_local_dnf_repos, load_local_builds
 )
-from module_build_service.db_session import db_session
-from module_build_service.errors import StreamAmbigous
-import module_build_service.messaging
+from module_build_service.common import conf, models
+from module_build_service.common.errors import StreamAmbigous
+from module_build_service.common.logger import level_flags
+from module_build_service.common.utils import load_mmd_file, import_mmd
 import module_build_service.scheduler.consumer
+from module_build_service.scheduler.db_session import db_session
+import module_build_service.scheduler.local
+from module_build_service.web.submit import submit_module_build_from_yaml
+
+
+def create_app(debug=False, verbose=False, quiet=False):
+    # logging (intended for flask-script, see manage.py)
+    log = logging.getLogger(__name__)
+    if debug:
+        log.setLevel(level_flags["debug"])
+    elif verbose:
+        log.setLevel(level_flags["verbose"])
+    elif quiet:
+        log.setLevel(level_flags["quiet"])
+
+    return app
 
 
 manager = Manager(create_app)
@@ -125,7 +138,7 @@ def build_module_locally(
     if "SERVER_NAME" not in app.config or not app.config["SERVER_NAME"]:
         app.config["SERVER_NAME"] = "localhost"
 
-        if app.config["RESOLVER"] == "db":
+        if conf.resolver == "db":
             raise ValueError(
                 "Please set RESOLVER to 'mbs' in your configuration for local builds.")
 
@@ -181,10 +194,7 @@ def build_module_locally(
 
         module_build_ids = [build.id for build in module_builds]
 
-    stop = module_build_service.scheduler.make_simple_stop_condition()
-
-    # Run the consumer until stop_condition returns True
-    module_build_service.scheduler.main([], stop)
+    module_build_service.scheduler.local.main(module_build_ids)
 
     has_failed_module = db_session.query(models.ModuleBuild).filter(
         models.ModuleBuild.id.in_(module_build_ids),

@@ -16,7 +16,8 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.ext.declarative import declarative_base
 
 # Data migration imports
-from module_build_service import Modulemd, conf
+from module_build_service.common import conf
+from module_build_service.common.modulemd import Modulemd
 
 
 Base = declarative_base()

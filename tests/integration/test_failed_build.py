@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 
-import utils
 
-
-def test_failed_build(test_env, scenario, repo, koji):
+def test_failed_build(pkg_util, scenario, repo, koji):
     """
     Run the build with "rebuild_strategy=all".
 
@@ -13,14 +11,15 @@ def test_failed_build(test_env, scenario, repo, koji):
       * Check that any other components in the same batch as the failed component are
         cancelled, if not completed.
     """
-    build = utils.Build(test_env["packaging_utility"], test_env["mbs_api"])
     repo.bump()
-    build.run(
+    builds = pkg_util.run(
         "--optional",
         "rebuild_strategy=all",
         reuse=scenario.get("build_id"),
     )
-    build.watch()
+    assert len(builds) == 1
+    build = builds[0]
+    pkg_util.watch(builds)
 
     assert build.state_name == "failed"
     batch = scenario["batch"]

@@ -1,0 +1,54 @@
+#!/bin/bash -ex
+
+export PIPELINE_ID=$1
+if [ -z "$PIPELINE_ID" ]; then
+    echo You must specify the pipeline ID
+    exit 1
+fi
+
+if [ "$TESTCASES" == "skip" ]; then
+    echo "TESTCASES=skip defined, skipping tests"
+    exit 0
+fi
+
+export TEST_DIR=$(realpath $(dirname $0))
+CONTROLLER=http://${PIPELINE_ID}.cloud.paas.psi.redhat.com
+echo "Provisioning pipeline services..."
+curl -X POST -F data=@${TEST_DIR}/mbs-cgimport-vars.yaml $CONTROLLER/scripts/provision
+CERT_DIR=$(mktemp -d)
+export CACERT="${CERT_DIR}/ca.crt"
+curl -s ${CONTROLLER}/ca/cacert > $CACERT
+export KRB5_CONFIG=$(mktemp)
+curl -so $KRB5_CONFIG ${CONTROLLER}/krb5/configfile
+export MBS_FRONTEND_HOST="$(curl -s ${CONTROLLER}/vars/MBS_FRONTEND_HOST)"
+# The MBS user is defined in the Ansible vars file
+export MBS_USER="mbs-user-${PIPELINE_ID}"
+export MBS_USER_PASSWORD=$(curl -s ${CONTROLLER}/krb5/principal/${MBS_USER})
+kinit -V $MBS_USER <<<$MBS_USER_PASSWORD
+
+CLIENT_CERTS="${CERT_DIR}/client.pem"
+curl -s ${CONTROLLER}/ca/${MBS_USER}/cert > ${CLIENT_CERTS}
+curl -s ${CONTROLLER}/ca/${MBS_USER}/key >> ${CLIENT_CERTS}
+
+KOJI_HUB_HOST="$(curl -s ${CONTROLLER}/vars/KOJI_HUB_HOST)"
+export KOJI_CONFIG=$(mktemp)
+cat > $KOJI_CONFIG <<EOF
+[koji]
+server = https://${KOJI_HUB_HOST}/kojihub
+weburl = https://${KOJI_HUB_HOST}/koji
+serverca = $CACERT
+authtype = ssl
+cert = ${CLIENT_CERTS}
+EOF
+
+for TEST_FILE in $(ls ${TEST_DIR}); do
+    TEST="${TEST_DIR}/${TEST_FILE}"
+    if [ -x "$TEST" ] && [ "${TEST_FILE}" != "runtests" ]; then
+       if [ -z "$TESTCASES" ] || echo "$TESTCASES" | grep "${TEST_FILE}"; then
+           echo "Running test ${TEST_FILE}"
+           $TEST
+       else
+           echo "Skipping test ${TEST_FILE}"
+       fi
+    fi
+done

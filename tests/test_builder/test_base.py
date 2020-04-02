@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
+
 import mock
-
-import module_build_service.models
-import module_build_service.builder
-import module_build_service.resolver
-
-from tests import init_data
-
-from module_build_service.db_session import db_session
-from module_build_service.builder import GenericBuilder
 from mock import patch
+
+import module_build_service.builder
+from module_build_service.builder import GenericBuilder
+import module_build_service.common.models
+import module_build_service.resolver
+from module_build_service.scheduler.db_session import db_session
+from tests import init_data
 
 
 class TestGenericBuilder:
@@ -28,7 +28,7 @@ class TestGenericBuilder:
 
         expected_groups = {"build": [], "srpm-build": []}
 
-        module = module_build_service.models.ModuleBuild.get_by_id(db_session, 1)
+        module = module_build_service.common.models.ModuleBuild.get_by_id(db_session, 1)
 
         generic_resolver.create.return_value = resolver
         # Call default_buildroot_groups, the result should be cached.

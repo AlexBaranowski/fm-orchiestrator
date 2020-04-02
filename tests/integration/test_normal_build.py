@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 
-import utils
 
-
-def test_normal_build(test_env, scenario, repo, koji):
+def test_normal_build(pkg_util, scenario, repo, koji):
     """
     Run build with `rhpkg-stage module-build --optional rebuild_strategy=all`
 
@@ -17,14 +15,15 @@ def test_normal_build(test_env, scenario, repo, koji):
     * Check that MBS changed the buildrequired platform to have a suffix of “z”
         if a Platform stream is representing a GA RHEL release.
     """
-    build = utils.Build(test_env["packaging_utility"], test_env["mbs_api"])
     repo.bump()
-    build_id = build.run(
+    builds = pkg_util.run(
         "--optional",
         "rebuild_strategy=all",
         reuse=scenario.get("build_id"),
     )
-    build.watch()
+    assert len(builds) == 1
+    pkg_util.watch(builds)
+    build = builds[0]
 
     assert sorted(build.component_names()) == sorted(repo.components + ["module-build-macros"])
 
@@ -36,7 +35,7 @@ def test_normal_build(test_env, scenario, repo, koji):
     cg_build = koji.get_build(build.nvr())
     cg_devel_build = koji.get_build(build.nvr(name_suffix="-devel"))
     assert cg_build and cg_devel_build
-    assert cg_devel_build['extra']['typeinfo']['module']['module_build_service_id'] == int(build_id)
+    assert cg_devel_build['extra']['typeinfo']['module']['module_build_service_id'] == int(build.id)
 
     modulemd = koji.get_modulemd(cg_build)
     actual_platforms = modulemd["data"]["dependencies"][0]["buildrequires"]["platform"]

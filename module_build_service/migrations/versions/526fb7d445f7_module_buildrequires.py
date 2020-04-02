@@ -14,8 +14,9 @@ from alembic import op
 import sqlalchemy as sa
 
 # Data migration imports
-from module_build_service import Modulemd, conf
-from module_build_service.models import ModuleBuild
+from module_build_service.common import conf
+from module_build_service.common.models import ModuleBuild
+from module_build_service.common.modulemd import Modulemd
 
 # Data migration tables
 mb = sa.Table(

@@ -1,157 +1,174 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
+import json
+
+from mock import patch, Mock
 import pytest
 
-from mock import call, patch, Mock
-from sqlalchemy import func
-
-from module_build_service import conf
-from module_build_service.db_session import db_session
-from module_build_service.models import BUILD_STATES, ModuleBuild
-from module_build_service.scheduler.consumer import MBSConsumer
-from module_build_service.scheduler.handlers.greenwave import get_corresponding_module_build
-from module_build_service.scheduler.handlers.greenwave import decision_update
+from module_build_service.scheduler.greenwave import greenwave
 from tests import clean_database, make_module_in_db
 
 
-class TestGetCorrespondingModuleBuild:
-    """Test get_corresponding_module_build"""
+class TestGreenwaveQuery():
 
     def setup_method(self, method):
         clean_database()
 
-    @patch("koji.ClientSession")
-    def test_module_build_nvr_does_not_exist_in_koji(self, ClientSession):
-        ClientSession.return_value.getBuild.return_value = None
-
-        assert get_corresponding_module_build("n-v-r") is None
-
-    @pytest.mark.parametrize(
-        "build_info",
-        [
-            # Build info does not have key extra
-            {"id": 1000, "name": "ed"},
-            # Build info contains key extra, but it is not for the module build
-            {"extra": {"submitter": "osbs", "image": {}}},
-            # Key module_build_service_id is missing
-            {"extra": {"typeinfo": {"module": {}}}},
-        ],
-    )
-    @patch("koji.ClientSession")
-    def test_cannot_find_module_build_id_from_build_info(self, ClientSession, build_info):
-        ClientSession.return_value.getBuild.return_value = build_info
-
-        assert get_corresponding_module_build("n-v-r") is None
-
-    @patch("koji.ClientSession")
-    def test_corresponding_module_build_id_does_not_exist_in_db(self, ClientSession):
-        fake_module_build_id, = db_session.query(func.max(ModuleBuild.id)).first()
-
-        ClientSession.return_value.getBuild.return_value = {
-            "extra": {"typeinfo": {"module": {"module_build_service_id": fake_module_build_id + 1}}}
-        }
-
-        assert get_corresponding_module_build("n-v-r") is None
-
-    @patch("koji.ClientSession")
-    def test_find_the_module_build(self, ClientSession):
-        expected_module_build = (
-            db_session.query(ModuleBuild).filter(ModuleBuild.name == "platform").first()
-        )
-
-        ClientSession.return_value.getBuild.return_value = {
-            "extra": {"typeinfo": {"module": {"module_build_service_id": expected_module_build.id}}}
-        }
-
-        build = get_corresponding_module_build("n-v-r")
-
-        assert expected_module_build.id == build.id
-        assert expected_module_build.name == build.name
-
-
-class TestDecisionUpdateHandler:
-    """Test handler decision_update"""
-
-    @patch("module_build_service.scheduler.handlers.greenwave.log")
-    def test_decision_context_is_not_match(self, log):
-        msg = Mock(msg_id="msg-id-1", decision_context="bodhi_update_push_testing")
-        decision_update(conf, msg)
-        log.debug.assert_called_once_with(
-            'Skip Greenwave message %s as MBS only handles messages with the decision context "%s"',
-            "msg-id-1",
-            "test_dec_context"
-        )
-
-    @patch("module_build_service.scheduler.handlers.greenwave.log")
-    def test_not_satisfy_policies(self, log):
-        msg = Mock(
-            msg_id="msg-id-1",
-            decision_context="test_dec_context",
-            policies_satisfied=False,
-            subject_identifier="pkg-0.1-1.c1",
-        )
-        decision_update(conf, msg)
-        log.debug.assert_called_once_with(
-            "Skip to handle module build %s because it has not satisfied Greenwave policies.",
-            msg.subject_identifier,
-        )
-
-    @patch("module_build_service.messaging.publish")
-    @patch("koji.ClientSession")
-    def test_transform_from_done_to_ready(self, ClientSession, publish):
-        clean_database()
-
-        # This build should be queried and transformed to ready state
-        module_build = make_module_in_db(
-            "pkg:0.1:1:c1",
-            [
+    @patch("module_build_service.scheduler.greenwave.requests")
+    def test_greenwave_query_decision(self, mock_requests):
+        resp_status = 200
+        resp_content = {
+            "applicable_policies": ["osci_compose_modules"],
+            "policies_satisfied": True,
+            "satisfied_requirements": [
                 {
-                    "requires": {"platform": ["el8"]},
-                    "buildrequires": {"platform": ["el8"]},
+                    "result_id": 7336633,
+                    "testcase": "test-ci.test-module.tier1",
+                    "type": "test-result-passed"
+                },
+                {
+                    "result_id": 7336650,
+                    "testcase": "test-ci.test-module.tier2",
+                    "type": "test-result-passed"
                 }
             ],
-        )
-        module_build.transition(
-            db_session, conf, BUILD_STATES["done"], "Move to done directly for running test."
-        )
-        db_session.commit()
+            "summary": "All required tests passed",
+            "unsatisfied_requirements": []
+        }
+        response = Mock()
+        response.json.return_value = resp_content
+        response.status_code = resp_status
+        mock_requests.post.return_value = response
 
-        # Assert this call below
-        first_publish_call = call(
-            service="mbs",
-            topic="module.state.change",
-            msg=module_build.json(db_session, show_tasks=False),
-            conf=conf,
+        fake_build = make_module_in_db(
+            "pkg:0.1:1:c1", [{
+                "requires": {"platform": ["el8"]},
+                "buildrequires": {"platform": ["el8"]},
+            }],
         )
+        got_response = greenwave.query_decision(fake_build, prod_version="xxxx-8")
 
-        ClientSession.return_value.getBuild.return_value = {
-            "extra": {"typeinfo": {"module": {"module_build_service_id": module_build.id}}}
+        assert got_response == resp_content
+        assert json.loads(mock_requests.post.call_args_list[0][1]["data"]) == {
+            "decision_context": "test_dec_context",
+            "product_version": "xxxx-8", "subject_type": "some-module",
+            "subject_identifier": "pkg-0.1-1.c1"}
+        assert mock_requests.post.call_args_list[0][1]["headers"] == {
+            "Content-Type": "application/json"}
+        assert mock_requests.post.call_args_list[0][1]["url"] == \
+            "https://greenwave.example.local/api/v1.0/decision"
+
+    @pytest.mark.parametrize("return_all", (False, True))
+    @patch("module_build_service.scheduler.greenwave.requests")
+    def test_greenwave_query_policies(self, mock_requests, return_all):
+        resp_status = 200
+        resp_content = {
+            "policies": [
+                {
+                    "decision_context": "test_dec_context",
+                    "product_versions": ["ver1", "ver3"],
+                    "rules": [],
+                    "subject_type": "some-module"
+                },
+                {
+                    "decision_context": "test_dec_context",
+                    "product_versions": ["ver1", "ver2"],
+                    "rules": [],
+                    "subject_type": "some-module"
+                },
+                {
+                    "decision_context": "decision_context_2",
+                    "product_versions": ["ver4"],
+                    "rules": [],
+                    "subject_type": "subject_type_2"
+                }
+            ]
+        }
+        selected_policies = {"policies": resp_content["policies"][:-1]}
+
+        response = Mock()
+        response.json.return_value = resp_content
+        response.status_code = resp_status
+        mock_requests.get.return_value = response
+
+        got_response = greenwave.query_policies(return_all)
+
+        if return_all:
+            assert got_response == resp_content
+        else:
+            assert got_response == selected_policies
+        assert mock_requests.get.call_args_list[0][1]["url"] == \
+            "https://greenwave.example.local/api/v1.0/policies"
+
+    @patch("module_build_service.scheduler.greenwave.requests")
+    def test_greenwave_get_product_versions(self, mock_requests):
+        resp_status = 200
+        resp_content = {
+            "policies": [
+                {
+                    "decision_context": "test_dec_context",
+                    "product_versions": ["ver1", "ver3"],
+                    "rules": [],
+                    "subject_type": "some-module"
+                },
+                {
+                    "decision_context": "test_dec_context",
+                    "product_versions": ["ver1", "ver2"],
+                    "rules": [],
+                    "subject_type": "some-module"
+                },
+                {
+                    "decision_context": "decision_context_2",
+                    "product_versions": ["ver4"],
+                    "rules": [],
+                    "subject_type": "subject_type_2"
+                }
+            ]
+        }
+        expected_versions = {"ver1", "ver2", "ver3"}
+
+        response = Mock()
+        response.json.return_value = resp_content
+        response.status_code = resp_status
+        mock_requests.get.return_value = response
+
+        versions_set = greenwave.get_product_versions()
+
+        assert versions_set == expected_versions
+        assert mock_requests.get.call_args_list[0][1]["url"] == \
+            "https://greenwave.example.local/api/v1.0/policies"
+
+    @pytest.mark.parametrize("policies_satisfied", (True, False))
+    @patch("module_build_service.scheduler.greenwave.requests")
+    def test_greenwave_check_gating(self, mock_requests, policies_satisfied):
+        resp_status = 200
+        policies_content = {
+            "policies": [
+                {
+                    "decision_context": "test_dec_context",
+                    "product_versions": ["ver1", "ver3"],
+                    "rules": [],
+                    "subject_type": "some-module"
+                }
+            ]
         }
 
-        msg = {
-            "msg_id": "msg-id-1",
-            "topic": "org.fedoraproject.prod.greenwave.decision.update",
-            "msg": {
-                "decision_context": "test_dec_context",
-                "policies_satisfied": True,
-                "subject_identifier": "pkg-0.1-1.c1",
-            },
-        }
-        hub = Mock(config={"validate_signatures": False})
-        consumer = MBSConsumer(hub)
-        consumer.consume(msg)
+        responses = [Mock() for i in range(3)]
+        for r in responses:
+            r.status_code = resp_status
+        responses[0].json.return_value = policies_content
+        responses[1].json.return_value = {"policies_satisfied": False}
+        responses[2].json.return_value = {"policies_satisfied": policies_satisfied}
+        mock_requests.get.return_value = responses[0]
+        mock_requests.post.side_effect = responses[1:]
 
-        db_session.add(module_build)
-        # Load module build again to check its state is moved correctly
-        db_session.refresh(module_build)
-        assert BUILD_STATES["ready"] == module_build.state
+        fake_build = make_module_in_db(
+            "pkg:0.1:1:c1", [{
+                "requires": {"platform": ["el8"]},
+                "buildrequires": {"platform": ["el8"]},
+            }],
+        )
+        result = greenwave.check_gating(fake_build)
 
-        publish.assert_has_calls([
-            first_publish_call,
-            call(
-                service="mbs",
-                topic="module.state.change",
-                msg=module_build.json(db_session, show_tasks=False),
-                conf=conf,
-            ),
-        ])
+        assert result == policies_satisfied

@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 
-import utils
 import time
 
 
-def test_resume_cancelled_build(test_env, scenario, repo, koji):
+def test_resume_cancelled_build(pkg_util, scenario, repo, koji):
     """
     Run the  build with "rebuild_strategy=all".
     Wait until the module-build-macros build is submitted to Koji.
@@ -17,17 +16,20 @@ def test_resume_cancelled_build(test_env, scenario, repo, koji):
       * Check that the testmodule build succeeded
 
     """
-    build = utils.Build(test_env["packaging_utility"], test_env["mbs_api"])
     repo.bump()
-    build.run(
+    builds = pkg_util.run(
         "--optional",
         "rebuild_strategy=all",
     )
+
+    assert len(builds) == 1
+    build = builds[0]
     build.wait_for_koji_task_id(package="module-build-macros", batch=1)
-    build.cancel()
+    pkg_util.cancel(build)
     # Behave like a human: restarting the build too quickly would lead to an error.
     time.sleep(10)
-    build.run("--watch")
-
+    builds = pkg_util.run("--watch")
+    assert len(builds) == 1
+    build = builds[0]
     assert build.state_name == "ready"
     assert build.was_cancelled()

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
 from collections import namedtuple
 import errno
 
@@ -7,12 +8,13 @@ import dnf
 from mock import call, Mock, patch, PropertyMock
 import pytest
 
-from module_build_service.db_session import db_session
-from module_build_service.errors import UnprocessableEntity
-from module_build_service.models import ModuleBuild
+from module_build_service.common.config import conf
+from module_build_service.common.errors import UnprocessableEntity
+from module_build_service.common.models import ModuleBuild
+from module_build_service.common.utils import import_mmd, load_mmd, mmd_to_str
 from module_build_service.scheduler import default_modules
-from module_build_service.utils.general import load_mmd, mmd_to_str
-from tests import clean_database, conf, make_module_in_db, read_staged_data, import_mmd
+from module_build_service.scheduler.db_session import db_session
+from tests import clean_database, make_module_in_db, read_staged_data
 
 
 @patch("module_build_service.scheduler.default_modules.handle_collisions_with_base_module_rpms")
@@ -52,7 +54,7 @@ def test_add_default_modules(mock_get_dm, mock_hc):
         "python": "3",
         "ruby": "2.6",
     }
-    defaults_added = default_modules.add_default_modules(mmd, ["x86_64"])
+    defaults_added = default_modules.add_default_modules(mmd)
     # Make sure that the default modules were added. ruby:2.6 will be ignored since it's not in
     # the database
     assert set(mmd.get_xmd()["mbs"]["buildrequires"].keys()) == {"nodejs", "platform", "python"}
@@ -72,7 +74,7 @@ def test_add_default_modules_not_linked(mock_get_dm):
     clean_database()
     mmd = load_mmd(read_staged_data("formatted_testmodule.yaml"))
     assert set(mmd.get_xmd()["mbs"]["buildrequires"].keys()) == {"platform"}
-    default_modules.add_default_modules(mmd, ["x86_64"])
+    default_modules.add_default_modules(mmd)
     assert set(mmd.get_xmd()["mbs"]["buildrequires"].keys()) == {"platform"}
     mock_get_dm.assert_not_called()
 
@@ -88,7 +90,7 @@ def test_add_default_modules_platform_not_available():
 
     expected_error = "Failed to retrieve the module platform:f28:3:00000000 from the database"
     with pytest.raises(RuntimeError, match=expected_error):
-        default_modules.add_default_modules(mmd, ["x86_64"])
+        default_modules.add_default_modules(mmd)
 
 
 @patch("module_build_service.scheduler.default_modules._get_default_modules")
@@ -136,7 +138,7 @@ def test_add_default_modules_compatible_platforms(mock_get_dm):
         "python": "3",
         "ruby": "2.6",
     }
-    defaults_added = default_modules.add_default_modules(mmd, ["x86_64"])
+    defaults_added = default_modules.add_default_modules(mmd)
     # Make sure that the default modules were added. ruby:2.6 will be ignored since it's not in
     # the database
     assert set(mmd.get_xmd()["mbs"]["buildrequires"].keys()) == {"nodejs", "platform"}
@@ -178,7 +180,7 @@ def test_add_default_modules_request_failed(mock_get_dm):
     mock_get_dm.side_effect = ValueError(expected_error)
 
     with pytest.raises(ValueError, match=expected_error):
-        default_modules.add_default_modules(mmd, ["x86_64"])
+        default_modules.add_default_modules(mmd)
 
 
 @pytest.mark.parametrize("is_rawhide", (True, False))
@@ -255,18 +257,18 @@ def test_get_default_modules_invalid_branch(
         mock_scm.return_value.checkout_ref.assert_called_once_with("f32")
 
 
-@patch("module_build_service.scheduler.default_modules.KojiModuleBuilder")
-def test_get_rawhide_version(mock_koji_builder):
+@patch("module_build_service.scheduler.default_modules.get_session")
+def test_get_rawhide_version(mock_get_session):
     """
     Test that _get_rawhide_version will return rawhide Fedora version.
     """
-    mock_koji_builder.get_session.return_value.getBuildTarget.return_value = {
+    mock_get_session.return_value.getBuildTarget.return_value = {
         "build_tag_name": "f32-build",
     }
     assert default_modules._get_rawhide_version() == "f32"
 
 
-@patch("module_build_service.scheduler.default_modules.KojiModuleBuilder.get_session")
+@patch("module_build_service.scheduler.default_modules.get_session")
 @patch("module_build_service.scheduler.default_modules._get_rpms_from_tags")
 def test_handle_collisions_with_base_module_rpms(mock_grft, mock_get_session):
     """

@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: MIT
 """Generic resolver functions."""
 
+from __future__ import absolute_import
 
-import six
 from abc import ABCMeta, abstractmethod
+import six
 
-import module_build_service.config as cfg
-from module_build_service import conf
+from module_build_service.common.config import conf, SUPPORTED_RESOLVERS
 
 
 class GenericResolver(six.with_metaclass(ABCMeta)):
@@ -15,7 +15,7 @@ class GenericResolver(six.with_metaclass(ABCMeta)):
     External Api for resolvers
     """
 
-    _resolvers = cfg.SUPPORTED_RESOLVERS
+    _resolvers = SUPPORTED_RESOLVERS
 
     # Resolver name. Each subclass of GenericResolver must set its own name.
     backend = "generic"

@@ -1,6 +1,21 @@
 Change Log
 ==========
 
+v3.0.0
+------
+* Rearchitect MBS to support multiple backends using Celery
+* Send module build state changes only after they are available via the REST API
+* Set ``mock.yum.module_hotfixes = 1`` on created Koji build tags by default
+* Use Z stream base module streams per the schedule in product pages as well as the
+  existing behavior of past the GA date
+
+v2.32.0
+-------
+* Fix the provides of base modules when they have a stream version
+* Use gssapi if correct python-requests-kerberos is available
+* Actually fail if dnf can't read the repo
+* Make dnf timeout configurable
+
 v2.31.0
 -------
 * Use jinja templates to provide 'full-jobs'

@@ -2,36 +2,37 @@
 # SPDX-License-Identifier: MIT
 """ Handlers for module change events on the message bus. """
 
-from module_build_service import conf, models, log, build_logs
-import module_build_service.builder
+from __future__ import absolute_import
+from datetime import datetime
+import logging
+import os
+
+import koji
+from requests.exceptions import ConnectionError
+import six.moves.xmlrpc_client as xmlrpclib
+
+from module_build_service.builder import GenericBuilder
+from module_build_service.builder.KojiModuleBuilder import KojiModuleBuilder
+from module_build_service.builder.utils import get_rpm_release
+from module_build_service.common import models
+from module_build_service.common import build_logs, conf, log
+from module_build_service.common.errors import UnprocessableEntity, Forbidden, ValidationError
+from module_build_service.common.utils import mmd_to_str
+from module_build_service.common.retry import retry
 import module_build_service.resolver
-import module_build_service.utils
-import module_build_service.messaging
-from module_build_service.utils import (
-    attempt_to_reuse_all_components,
+from module_build_service.scheduler.submit import (
     record_component_builds,
-    get_rpm_release,
-    generate_koji_tag,
     record_filtered_rpms,
     record_module_build_arches
 )
-from module_build_service.db_session import db_session
-from module_build_service.errors import UnprocessableEntity, Forbidden, ValidationError
-from module_build_service.utils.greenwave import greenwave
+from module_build_service.scheduler import celery_app, events
+from module_build_service.scheduler.db_session import db_session
 from module_build_service.scheduler.default_modules import (
     add_default_modules, handle_collisions_with_base_module_rpms)
-from module_build_service.utils.submit import format_mmd
-from module_build_service.utils.ursine import handle_stream_collision_modules
-
-from requests.exceptions import ConnectionError
-from module_build_service.utils import mmd_to_str
-
-import koji
-import six.moves.xmlrpc_client as xmlrpclib
-import logging
-import os
-import time
-from datetime import datetime
+from module_build_service.scheduler.greenwave import greenwave
+from module_build_service.scheduler.reuse import attempt_to_reuse_all_components
+from module_build_service.scheduler.submit import format_mmd, get_module_srpm_overrides
+from module_build_service.scheduler.ursine import handle_stream_collision_modules
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -40,27 +41,31 @@ def get_artifact_from_srpm(srpm_path):
     return os.path.basename(srpm_path).replace(".src.rpm", "")
 
 
-def failed(config, msg):
-    """
-    Called whenever a module enters the 'failed' state.
+@celery_app.task
+@events.mbs_event_handler
+def failed(msg_id, module_build_id, module_build_state):
+    """Called whenever a module enters the 'failed' state.
 
     We cancel all the remaining component builds of a module
     and stop the building.
+
+    :param str msg_id: the original id of the message being handled, which is
+        received from the message bus.
+    :param int module_build_id: the module build id.
+    :param int module_build_state: the module build state.
     """
+    build = models.ModuleBuild.get_by_id(db_session, module_build_id)
 
-    build = models.ModuleBuild.from_module_event(db_session, msg)
-
-    if build.state != msg.module_build_state:
+    if build.state != module_build_state:
         log.warning(
             "Note that retrieved module state %r doesn't match message module state %r",
-            build.state, msg.module_build_state,
+            build.state, module_build_state,
         )
         # This is ok.. it's a race condition we can ignore.
         pass
 
     if build.koji_tag:
-        builder = module_build_service.builder.GenericBuilder.create_from_module(
-            db_session, build, config)
+        builder = GenericBuilder.create_from_module(db_session, build, conf)
 
         if build.new_repo_task_id:
             builder.cancel_build(build.new_repo_task_id)
@@ -80,7 +85,7 @@ def failed(config, msg):
             reason = "Missing koji tag. Assuming previously failed module lookup."
             log.error(reason)
             build.transition(
-                db_session, config,
+                db_session, conf,
                 state=models.BUILD_STATES["failed"],
                 state_reason=reason, failure_type="infra")
             db_session.commit()
@@ -89,27 +94,34 @@ def failed(config, msg):
     # Don't transition it again if it's already been transitioned
     if build.state != models.BUILD_STATES["failed"]:
         build.transition(
-            db_session, config, state=models.BUILD_STATES["failed"], failure_type="user")
+            db_session, conf, state=models.BUILD_STATES["failed"], failure_type="user")
 
     db_session.commit()
 
     build_logs.stop(build)
-    module_build_service.builder.GenericBuilder.clear_cache(build)
+    GenericBuilder.clear_cache(build)
 
 
-def done(config, msg):
+@celery_app.task
+@events.mbs_event_handler
+def done(msg_id, module_build_id, module_build_state):
     """Called whenever a module enters the 'done' state.
 
     We currently don't do anything useful, so moving to ready.
     Except for scratch module builds, which remain in the done state.
     Otherwise the done -> ready state should happen when all
     dependent modules were re-built, at least that's the current plan.
+
+    :param str msg_id: the original id of the message being handled, which is
+        received from the message bus.
+    :param int module_build_id: the module build id.
+    :param int module_build_state: the module build state.
     """
-    build = models.ModuleBuild.from_module_event(db_session, msg)
-    if build.state != msg.module_build_state:
+    build = models.ModuleBuild.get_by_id(db_session, module_build_id)
+    if build.state != module_build_state:
         log.warning(
             "Note that retrieved module state %r doesn't match message module state %r",
-            build.state, msg.module_build_state,
+            build.state, module_build_state,
         )
         # This is ok.. it's a race condition we can ignore.
         pass
@@ -117,7 +129,7 @@ def done(config, msg):
     # Scratch builds stay in 'done' state
     if not build.scratch:
         if greenwave is None or greenwave.check_gating(build):
-            build.transition(db_session, config, state=models.BUILD_STATES["ready"])
+            build.transition(db_session, conf, state=models.BUILD_STATES["ready"])
         else:
             build.state_reason = "Gating failed"
             if greenwave.error_occurred:
@@ -126,18 +138,30 @@ def done(config, msg):
         db_session.commit()
 
     build_logs.stop(build)
-    module_build_service.builder.GenericBuilder.clear_cache(build)
+    GenericBuilder.clear_cache(build)
 
 
-def init(config, msg):
-    """ Called whenever a module enters the 'init' state."""
-    # Sleep for a few seconds to make sure the module in the database is committed
-    # TODO: Remove this once messaging is implemented in SQLAlchemy hooks
-    for i in range(3):
-        build = models.ModuleBuild.from_module_event(db_session, msg)
-        if build:
-            break
-        time.sleep(1)
+@celery_app.task
+@events.mbs_event_handler
+def init(msg_id, module_build_id, module_build_state):
+    """Called whenever a module enters the 'init' state.
+
+    :param str msg_id: the original id of the message being handled, which is
+        received from message bus.
+    :param int module_build_id: the module build id.
+    :param int module_build_state: the module build state.
+    """
+    build = models.ModuleBuild.get_by_id(db_session, module_build_id)
+
+    state_init = models.BUILD_STATES["init"]
+    if module_build_state == state_init and build.state != state_init:
+        log.warning(
+            "Module build %r has moved to %s state already.",
+            build, models.INVERSE_BUILD_STATES[build.state])
+        log.warning(
+            "Ignore this message %s. Is there something wrong with the frontend"
+            " that sends duplicate messages?", msg_id)
+        return
 
     # for MockModuleBuilder, set build logs dir to mock results dir
     # before build_logs start
@@ -157,11 +181,13 @@ def init(config, msg):
         mmd = build.mmd()
         record_module_build_arches(mmd, build)
         arches = [arch.name for arch in build.arches]
-        defaults_added = add_default_modules(mmd, arches)
+        defaults_added = add_default_modules(mmd)
 
+        # Get map of packages that have SRPM overrides
+        srpm_overrides = get_module_srpm_overrides(build)
         # Format the modulemd by putting in defaults and replacing streams that
         # are branches with commit hashes
-        format_mmd(mmd, build.scmurl, build, db_session)
+        format_mmd(mmd, build.scmurl, build, db_session, srpm_overrides)
         record_component_builds(mmd, build)
 
         # The ursine.handle_stream_collision_modules is Koji specific.
@@ -226,7 +252,7 @@ def generate_module_build_koji_tag(build):
     """
     log.info("Getting tag for %s:%s:%s", build.name, build.stream, build.version)
     if conf.system in ["koji", "test"]:
-        return generate_koji_tag(
+        return KojiModuleBuilder.generate_koji_tag(
             build.name,
             build.stream,
             build.version,
@@ -238,7 +264,7 @@ def generate_module_build_koji_tag(build):
         return "-".join(["module", build.name, build.stream, build.version])
 
 
-@module_build_service.utils.retry(
+@retry(
     interval=10, timeout=120, wait_on=(ValueError, RuntimeError, ConnectionError)
 )
 def get_module_build_dependencies(build):
@@ -297,7 +323,9 @@ def get_content_generator_build_koji_tag(module_deps):
         return conf.koji_cg_default_build_tag
 
 
-def wait(config, msg):
+@celery_app.task
+@events.mbs_event_handler
+def wait(msg_id, module_build_id, module_build_state):
     """ Called whenever a module enters the 'wait' state.
 
     We transition to this state shortly after a modulebuild is first requested.
@@ -305,28 +333,21 @@ def wait(config, msg):
     All we do here is request preparation of the buildroot.
     The kicking off of individual component builds is handled elsewhere,
     in module_build_service.schedulers.handlers.repos.
+
+    :param str msg_id: the original id of the message being handled which is
+        received from the message bus.
+    :param int module_build_id: the module build id.
+    :param int module_build_state: the module build state.
     """
-
-    # Wait for the db on the frontend to catch up to the message, otherwise the
-    # xmd information won't be present when we need it.
-    # See https://pagure.io/fm-orchestrator/issue/386
-    @module_build_service.utils.retry(interval=10, timeout=120, wait_on=RuntimeError)
-    def _get_build_containing_xmd_for_mbs():
-        build = models.ModuleBuild.from_module_event(db_session, msg)
-        if "mbs" in build.mmd().get_xmd():
-            return build
-        db_session.expire(build)
-        raise RuntimeError("{!r} doesn't contain xmd information for MBS.".format(build))
-
-    build = _get_build_containing_xmd_for_mbs()
+    build = models.ModuleBuild.get_by_id(db_session, module_build_id)
 
     log.info("Found build=%r from message" % build)
     log.debug("%r", build.modulemd)
 
-    if build.state != msg.module_build_state:
+    if build.state != module_build_state:
         log.warning(
             "Note that retrieved module state %r doesn't match message module state %r",
-            build.state, msg.module_build_state,
+            build.state, module_build_state,
         )
         # This is ok.. it's a race condition we can ignore.
         pass
@@ -337,7 +358,7 @@ def wait(config, msg):
         reason = "Failed to get module info from MBS. Max retries reached."
         log.exception(reason)
         build.transition(
-            db_session, config,
+            db_session, conf,
             state=models.BUILD_STATES["failed"],
             state_reason=reason, failure_type="infra")
         db_session.commit()
@@ -365,8 +386,7 @@ def wait(config, msg):
             "It is disabled to tag module build during importing into Koji by Content Generator.")
         log.debug("Skip to assign Content Generator build koji tag to module build.")
 
-    builder = module_build_service.builder.GenericBuilder.create_from_module(
-        db_session, build, config)
+    builder = GenericBuilder.create_from_module(db_session, build, conf)
 
     log.debug(
         "Adding dependencies %s into buildroot for module %s:%s:%s",
@@ -376,21 +396,20 @@ def wait(config, msg):
 
     if not build.component_builds:
         log.info("There are no components in module %r, skipping build" % build)
-        build.transition(db_session, config, state=models.BUILD_STATES["build"])
+        build.transition(db_session, conf, state=models.BUILD_STATES["build"])
         db_session.add(build)
         db_session.commit()
         # Return a KojiRepoChange message so that the build can be transitioned to done
         # in the repos handler
-        return [
-            module_build_service.messaging.KojiRepoChange(
-                "handlers.modules.wait: fake msg", builder.module_build_tag["name"])
-        ]
+        from module_build_service.scheduler.handlers.repos import done as repos_done_handler
+        events.scheduler.add(repos_done_handler, ("fake_msg", builder.module_build_tag["name"]))
+        return
 
     # If all components in module build will be reused, we don't have to build
     # module-build-macros, because there won't be any build done.
     if attempt_to_reuse_all_components(builder, build):
         log.info("All components have been reused for module %r, skipping build" % build)
-        build.transition(db_session, config, state=models.BUILD_STATES["build"])
+        build.transition(db_session, conf, state=models.BUILD_STATES["build"])
         db_session.add(build)
         db_session.commit()
         return []
@@ -402,7 +421,6 @@ def wait(config, msg):
     artifact_name = "module-build-macros"
 
     component_build = models.ComponentBuild.from_component_name(db_session, artifact_name, build.id)
-    further_work = []
     srpm = builder.get_disttag_srpm(
         disttag=".%s" % get_rpm_release(db_session, build),
         module_build=build)
@@ -419,10 +437,9 @@ def wait(config, msg):
         # Commit and refresh so that the SQLAlchemy relationships are available
         db_session.commit()
         db_session.refresh(component_build)
-        msgs = builder.recover_orphaned_artifact(component_build)
-        if msgs:
+        recovered = builder.recover_orphaned_artifact(component_build)
+        if recovered:
             log.info("Found an existing module-build-macros build")
-            further_work += msgs
         # There was no existing artifact found, so lets submit the build instead
         else:
             task_id, state, reason, nvr = builder.build(artifact_name=artifact_name, source=srpm)
@@ -434,10 +451,9 @@ def wait(config, msg):
         # It's possible that the build succeeded in the builder but some other step failed which
         # caused module-build-macros to be marked as failed in MBS, so check to see if it exists
         # first
-        msgs = builder.recover_orphaned_artifact(component_build)
-        if msgs:
+        recovered = builder.recover_orphaned_artifact(component_build)
+        if recovered:
             log.info("Found an existing module-build-macros build")
-            further_work += msgs
         else:
             task_id, state, reason, nvr = builder.build(artifact_name=artifact_name, source=srpm)
             component_build.task_id = task_id
@@ -446,19 +462,16 @@ def wait(config, msg):
             component_build.nvr = nvr
 
     db_session.add(component_build)
-    build.transition(db_session, config, state=models.BUILD_STATES["build"])
+    build.transition(db_session, conf, state=models.BUILD_STATES["build"])
     db_session.add(build)
     db_session.commit()
 
     # We always have to regenerate the repository.
-    if config.system == "koji":
+    if conf.system == "koji":
         log.info("Regenerating the repository")
         task_id = builder.koji_session.newRepo(builder.module_build_tag["name"])
         build.new_repo_task_id = task_id
         db_session.commit()
     else:
-        further_work.append(
-            module_build_service.messaging.KojiRepoChange(
-                "fake msg", builder.module_build_tag["name"])
-        )
-    return further_work
+        from module_build_service.scheduler.handlers.repos import done as repos_done_handler
+        events.scheduler.add(repos_done_handler, ("fake_msg", builder.module_build_tag["name"]))

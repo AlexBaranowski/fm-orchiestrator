@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
-import pytest
+from __future__ import absolute_import
 from datetime import datetime
 
+import pytest
+
+from module_build_service.common.config import conf
+from module_build_service.common.models import ModuleBuild
+from module_build_service.common.utils import import_mmd, load_mmd, mmd_to_str
+from module_build_service.scheduler.db_session import db_session
 import module_build_service.resolver as mbs_resolver
-from module_build_service.db_session import db_session
-from module_build_service.models import ModuleBuild
-from module_build_service.utils.general import import_mmd, mmd_to_str, load_mmd
 import tests
 
 
@@ -41,7 +44,7 @@ class TestLocalResolverModule:
         db_session.add(build)
         db_session.commit()
 
-        resolver = mbs_resolver.GenericResolver.create(db_session, tests.conf, backend="local")
+        resolver = mbs_resolver.GenericResolver.create(db_session, conf, backend="local")
         result = resolver.get_buildrequired_modulemds(
             "testmodule", "master", platform_f8.mmd().get_nsvc())
         nsvcs = {m.get_nsvc() for m in result}

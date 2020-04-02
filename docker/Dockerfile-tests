@@ -5,7 +5,6 @@ RUN yum -y update
 RUN yum -y install epel-release yum-utils
 # Required for the latest python-pungi
 RUN yum-config-manager --add-repo https://kojipkgs.fedoraproject.org/repos-dist/epel7Server-infra/latest/x86_64/
-# Remove libmodulemd1 after the following ticket is resolved https://pagure.io/fedora-infrastructure/issue/8206
 RUN yum -y install \
     --nogpgcheck \
     --setopt=deltarpm=0 \
@@ -19,7 +18,6 @@ RUN yum -y install \
     git \
     kobo \
     kobo-rpmlib \
-    libmodulemd1 \
     python-backports-ssl_match_hostname \
     python-dnf \
     python-dogpile-cache \
@@ -43,6 +41,7 @@ RUN yum -y install \
     python-sqlalchemy \
     python-tox \
     python2-distro \
+    python2-celery \
     python2-libmodulemd2 \
     python2-pyyaml \
     python2-pungi \
@@ -51,7 +50,9 @@ RUN yum -y install \
     && yum clean all
 # We currently require newer versions of these Python packages for the tests.
 # more-itertools is required by pytest, but versions 6.0.0 and up aren't Python 2 compatible
-RUN pip install --upgrade flask-sqlalchemy "pytest<5.0" flake8 tox pip "more-itertools<6.0.0" pytest-cov
+RUN pip install --upgrade "pytest<5.0" flake8 tox pip "more-itertools<6.0.0" pytest-cov
+# Install zipp as a workaround for https://github.com/pypa/virtualenv/issues/1630
+RUN pip install zipp
 VOLUME /src
 WORKDIR /src
 ENTRYPOINT ["docker/test.sh"]

@@ -156,7 +156,7 @@ the ``scheduler.handlers.repos.done(...)`` method is called.
 
 This verifies that all the packages from the current batch (just module-build-macros for now)
 really appear in the generated repository and if so, it starts building the next batch by calling
-``utils.batches.start_next_batch_build(...)``.
+``module_build_service.scheduler.batches.start_next_batch_build(...)``.
 
 
 Building the next batch

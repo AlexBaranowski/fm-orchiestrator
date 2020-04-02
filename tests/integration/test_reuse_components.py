@@ -4,7 +4,7 @@
 import utils
 
 
-def test_reuse_components(test_env, scenario, repo, koji):
+def test_reuse_components(pkg_util, test_env, scenario, repo, koji):
     """
     Bump the commit of one of the components that MBS uses.
     Bump the commit of the same testmodule that was mentioned in the preconditions.
@@ -16,14 +16,15 @@ def test_reuse_components(test_env, scenario, repo, koji):
     * Verify that the component with the changed commit was rebuilt.
     """
     repo.bump()
-    baseline_build = utils.Build(test_env["packaging_utility"], test_env["mbs_api"])
-    baseline_build.run(
+    baseline_builds = pkg_util.run(
         "--watch",
         "--optional",
         "rebuild_strategy=all",
         reuse=scenario.get("baseline_build_id"),
     )
+    assert len(baseline_builds) == 1
 
+    baseline_build = baseline_builds[0]
     package = scenario.get("package")
     component = utils.Component(
         package,
@@ -33,14 +34,14 @@ def test_reuse_components(test_env, scenario, repo, koji):
     component.bump()
 
     repo.bump()
-    build = utils.Build(test_env["packaging_utility"], test_env["mbs_api"])
-    build.run(
+    builds = pkg_util.run(
         "--watch",
         "--optional",
         "rebuild_strategy=only-changed",
         reuse=scenario.get("build_id"),
     )
-
+    assert len(builds) == 1
+    build = builds[0]
     comp_task_ids_base = baseline_build.component_task_ids()
     comp_task_ids = build.component_task_ids()
     comp_task_ids_base.pop('module-build-macros')

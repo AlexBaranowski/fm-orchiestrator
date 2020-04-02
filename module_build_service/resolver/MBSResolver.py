@@ -2,15 +2,17 @@
 # SPDX-License-Identifier: MIT
 """MBS handler functions."""
 
+from __future__ import absolute_import
 import logging
+
 import kobo.rpmlib
 
-from module_build_service import conf
-from module_build_service import models
-from module_build_service.errors import UnprocessableEntity
+from module_build_service.common import models
+from module_build_service.common.config import conf
+from module_build_service.common.errors import UnprocessableEntity
+from module_build_service.common.request_utils import requests_session
+from module_build_service.common.utils import load_mmd, import_mmd
 from module_build_service.resolver.KojiResolver import KojiResolver
-from module_build_service.utils.general import import_mmd, load_mmd
-from module_build_service.utils.request_utils import requests_session
 
 log = logging.getLogger()
 
@@ -279,7 +281,7 @@ class MBSResolver(KojiResolver):
                  set to union of all components defined in all installation
                  profiles matching the key using the buildrequires.
 
-        If there are some modules loaded by utils.load_local_builds(...), these
+        If there are some modules loaded by load_local_builds(...), these
         local modules will be considered when returning the profiles.
 
         https://pagure.io/fm-orchestrator/issue/181
@@ -406,7 +408,7 @@ class MBSResolver(KojiResolver):
         Resolves the requires list of N:S or N:S:V:C to a dictionary with keys as
         the module name and the values as a dictionary with keys of ref,
         stream, version.
-        If there are some modules loaded by utils.load_local_builds(...), these
+        If there are some modules loaded by load_local_builds(...), these
         local modules will be considered when resolving the requires. A RuntimeError
         is raised on MBS lookup errors.
         :param requires: a list of N:S or N:S:V:C strings
@@ -425,7 +427,7 @@ class MBSResolver(KojiResolver):
                 raise ValueError(
                     "Only N:S or N:S:V:C is accepted by resolve_requires, got %s" % nsvc)
             # Try to find out module dependency in the local module builds
-            # added by utils.load_local_builds(...).
+            # added by load_local_builds(...).
             local_modules = models.ModuleBuild.local_modules(
                 self.db_session, module_name, module_stream)
             if local_modules:

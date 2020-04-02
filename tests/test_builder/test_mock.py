@@ -1,20 +1,29 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
 import os
-import mock
-import koji
 import tempfile
 import shutil
 from textwrap import dedent
 
 import kobo.rpmlib
+import koji
+import mock
+import pytest
 
-from module_build_service import conf
-from module_build_service.db_session import db_session
-from module_build_service.models import ModuleBuild, ComponentBuild
-from module_build_service.builder.MockModuleBuilder import MockModuleBuilder
-from module_build_service.utils import import_fake_base_module, mmd_to_str, load_mmd
-from tests import clean_database, make_module_in_db, read_staged_data
+from module_build_service.common.config import conf
+from module_build_service.builder.MockModuleBuilder import (
+    import_fake_base_module,
+    import_builds_from_local_dnf_repos,
+    load_local_builds,
+    MockModuleBuilder,
+)
+from module_build_service.common import models
+from module_build_service.common.models import ModuleBuild, ComponentBuild
+from module_build_service.common.utils import load_mmd, mmd_to_str
+from module_build_service.scheduler import events
+from module_build_service.scheduler.db_session import db_session
+from tests import clean_database, make_module_in_db, read_staged_data, staged_data_filename
 
 
 class TestMockModuleBuilder:
@@ -113,7 +122,7 @@ class TestMockModuleBuilder:
 
         return module
 
-    @mock.patch("module_build_service.conf.system", new="mock")
+    @mock.patch("module_build_service.common.conf.system", new="mock")
     def test_createrepo_filter_last_batch(self):
         module = self._create_module_with_filters(db_session, 3, koji.BUILD_STATES["COMPLETE"])
 
@@ -140,7 +149,7 @@ class TestMockModuleBuilder:
             rpm_names = [kobo.rpmlib.parse_nvr(rpm)["name"] for rpm in pkglist.split("\n")]
             assert "ed" not in rpm_names
 
-    @mock.patch("module_build_service.conf.system", new="mock")
+    @mock.patch("module_build_service.common.conf.system", new="mock")
     def test_createrepo_not_last_batch(self):
         module = self._create_module_with_filters(db_session, 2, koji.BUILD_STATES["COMPLETE"])
 
@@ -165,7 +174,7 @@ class TestMockModuleBuilder:
             rpm_names = [kobo.rpmlib.parse_nvr(rpm)["name"] for rpm in pkglist.split("\n")]
             assert "ed" in rpm_names
 
-    @mock.patch("module_build_service.conf.system", new="mock")
+    @mock.patch("module_build_service.common.conf.system", new="mock")
     def test_createrepo_empty_rmp_list(self):
         module = self._create_module_with_filters(db_session, 3, koji.BUILD_STATES["COMPLETE"])
 
@@ -185,9 +194,9 @@ class TestMockModuleBuilderAddRepos:
     def setup_method(self, test_method):
         clean_database(add_platform_module=False)
 
-    @mock.patch("module_build_service.conf.system", new="mock")
+    @mock.patch("module_build_service.common.conf.system", new="mock")
     @mock.patch(
-        "module_build_service.config.Config.base_module_repofiles",
+        "module_build_service.common.config.Config.base_module_repofiles",
         new_callable=mock.PropertyMock,
         return_value=["/etc/yum.repos.d/bar.repo", "/etc/yum.repos.d/bar-updates.repo"],
         create=True,
@@ -232,3 +241,141 @@ class TestMockModuleBuilderAddRepos:
         assert "repofile 3" in builder.yum_conf
 
         assert set(builder.enabled_modules) == {"foo:1", "app:1"}
+
+
+class TestOfflineLocalBuilds:
+    def setup_method(self):
+        clean_database()
+
+    def teardown_method(self):
+        clean_database()
+
+    def test_import_fake_base_module(self):
+        import_fake_base_module("platform:foo:1:000000")
+        module_build = models.ModuleBuild.get_build_from_nsvc(
+            db_session, "platform", "foo", 1, "000000")
+        assert module_build
+
+        mmd = module_build.mmd()
+        xmd = mmd.get_xmd()
+        assert xmd == {
+            "mbs": {
+                "buildrequires": {},
+                "commit": "ref_000000",
+                "koji_tag": "repofile://",
+                "mse": "true",
+                "requires": {},
+            }
+        }
+
+        assert set(mmd.get_profile_names()) == {"buildroot", "srpm-buildroot"}
+
+    @mock.patch(
+        "module_build_service.builder.MockModuleBuilder.open",
+        create=True,
+        new_callable=mock.mock_open,
+    )
+    def test_import_builds_from_local_dnf_repos(self, patched_open):
+        with mock.patch("dnf.Base") as dnf_base:
+            repo = mock.MagicMock()
+            repo.repofile = "/etc/yum.repos.d/foo.repo"
+            mmd = load_mmd(read_staged_data("formatted_testmodule"))
+            repo.get_metadata_content.return_value = mmd_to_str(mmd)
+            base = dnf_base.return_value
+            base.repos = {"reponame": repo}
+            patched_open.return_value.readlines.return_value = ("FOO=bar", "PLATFORM_ID=platform:x")
+
+            import_builds_from_local_dnf_repos()
+
+            base.read_all_repos.assert_called_once()
+            repo.load.assert_called_once()
+            repo.get_metadata_content.assert_called_once_with("modules")
+
+            module_build = models.ModuleBuild.get_build_from_nsvc(
+                db_session, "testmodule", "master", 20180205135154, "9c690d0e")
+            assert module_build
+            assert module_build.koji_tag == "repofile:///etc/yum.repos.d/foo.repo"
+
+            module_build = models.ModuleBuild.get_build_from_nsvc(
+                db_session, "platform", "x", 1, "000000")
+            assert module_build
+
+    def test_import_builds_from_local_dnf_repos_platform_id(self):
+        with mock.patch("dnf.Base"):
+            import_builds_from_local_dnf_repos("platform:y")
+
+            module_build = models.ModuleBuild.get_build_from_nsvc(
+                db_session, "platform", "y", 1, "000000")
+            assert module_build
+
+
+@mock.patch(
+    "module_build_service.common.config.Config.mock_resultsdir",
+    new_callable=mock.PropertyMock,
+    return_value=staged_data_filename("local_builds")
+)
+@mock.patch(
+    "module_build_service.common.config.Config.system",
+    new_callable=mock.PropertyMock,
+    return_value="mock",
+)
+class TestLocalBuilds:
+    def setup_method(self):
+        clean_database()
+        events.scheduler.reset()
+
+    def teardown_method(self):
+        clean_database()
+        events.scheduler.reset()
+
+    def test_load_local_builds_name(self, conf_system, conf_resultsdir):
+        load_local_builds("testmodule")
+        local_modules = models.ModuleBuild.local_modules(db_session)
+
+        assert len(local_modules) == 1
+        assert local_modules[0].koji_tag.endswith(
+            "/module-testmodule-master-20170816080816/results")
+
+    def test_load_local_builds_name_stream(self, conf_system, conf_resultsdir):
+        load_local_builds("testmodule:master")
+        local_modules = models.ModuleBuild.local_modules(db_session)
+
+        assert len(local_modules) == 1
+        assert local_modules[0].koji_tag.endswith(
+            "/module-testmodule-master-20170816080816/results")
+
+    def test_load_local_builds_name_stream_non_existing(
+        self, conf_system, conf_resultsdir
+    ):
+        with pytest.raises(RuntimeError):
+            load_local_builds("testmodule:x")
+            models.ModuleBuild.local_modules(db_session)
+
+    def test_load_local_builds_name_stream_version(self, conf_system, conf_resultsdir):
+        load_local_builds("testmodule:master:20170816080815")
+        local_modules = models.ModuleBuild.local_modules(db_session)
+
+        assert len(local_modules) == 1
+        assert local_modules[0].koji_tag.endswith(
+            "/module-testmodule-master-20170816080815/results")
+
+    def test_load_local_builds_name_stream_version_non_existing(
+        self, conf_system, conf_resultsdir
+    ):
+        with pytest.raises(RuntimeError):
+            load_local_builds("testmodule:master:123")
+            models.ModuleBuild.local_modules(db_session)
+
+    def test_load_local_builds_platform(self, conf_system, conf_resultsdir):
+        load_local_builds("platform:f30")
+        local_modules = models.ModuleBuild.local_modules(db_session)
+
+        assert len(local_modules) == 1
+        assert local_modules[0].koji_tag.endswith("/module-platform-f30-3/results")
+
+    def test_load_local_builds_platform_f28(self, conf_system, conf_resultsdir):
+        load_local_builds("platform:f30")
+        local_modules = models.ModuleBuild.local_modules(db_session)
+
+        assert len(local_modules) == 1
+        assert local_modules[0].koji_tag.endswith("/module-platform-f30-3/results")

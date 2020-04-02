@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 
-import utils
 
-
-def test_no_components(test_env, scenario, repo, koji):
+def test_no_components(pkg_util, scenario, repo, koji):
     """
     Submit the testmodule build with `fedpkg module-build`
 
@@ -13,10 +11,12 @@ def test_no_components(test_env, scenario, repo, koji):
     * Verify that the testmodule build succeeds
 
     """
-    build = utils.Build(test_env["packaging_utility"], test_env["mbs_api"])
     repo.bump()
-    build.run(reuse=scenario.get("build_id"))
-    build.watch()
+    builds = pkg_util.run(reuse=scenario.get("build_id"))
+    assert len(builds) == 1
+
+    pkg_util.watch(builds)
+    build = builds[0]
 
     assert build.state_name == "ready"
     assert not build.data["component_builds"]

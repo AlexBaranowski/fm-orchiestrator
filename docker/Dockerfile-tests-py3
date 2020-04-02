@@ -10,6 +10,7 @@ RUN dnf -y install \
     createrepo_c \
     rsync \
     python3-distro \
+    python3-celery \
     python3-fedmsg \
     python3-kobo-rpmlib \
     python3-rpm \

@@ -119,8 +119,6 @@ objects:
           KOJI_PROXYUSER = False
           KOJI_REPOSITORY_URL = ''
           PDC_URL = ''
-          PDC_INSECURE = True
-          PDC_DEVELOP = True
           SCMURLS = []
           ALLOW_CUSTOM_SCMURLS = True
 
@@ -551,8 +549,6 @@ objects:
           KOJI_PROXYUSER = False
           KOJI_REPOSITORY_URL = ''
           PDC_URL = ''
-          PDC_INSECURE = True
-          PDC_DEVELOP = True
           SCMURLS = []
           ALLOW_CUSTOM_SCMURLS = True
 

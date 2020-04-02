@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
 import calendar
 import distro
 import hashlib
+from io import open
+from itertools import chain
 import logging
 import json
 import os
@@ -12,27 +15,20 @@ import shutil
 import subprocess
 import tempfile
 import time
-from io import open
-from itertools import chain
 
 import kobo.rpmlib
-
-from six import text_type
 import koji
 import pungi.arch
+from six import text_type
 
-from module_build_service import conf, log, build_logs, Modulemd
-from module_build_service.db_session import db_session
-from module_build_service.scm import SCM
-from module_build_service.utils import to_text_type, load_mmd, mmd_to_str
+from module_build_service.common.modulemd import Modulemd
+from module_build_service.common import conf, log, build_logs
+from module_build_service.common.koji import get_session, koji_retrying_multicall_map
+from module_build_service.common.scm import SCM
+from module_build_service.common.utils import load_mmd, mmd_to_str, to_text_type
+from module_build_service.scheduler.db_session import db_session
 
 logging.basicConfig(level=logging.DEBUG)
-
-
-def get_session(config, login=True):
-    from module_build_service.builder.KojiModuleBuilder import KojiModuleBuilder
-
-    return KojiModuleBuilder.get_session(config, login=login)
 
 
 def strip_suffixes(s, suffixes):
@@ -54,24 +50,13 @@ def strip_suffixes(s, suffixes):
     return s
 
 
-def koji_retrying_multicall_map(*args, **kwargs):
-    """
-    Wrapper around KojiModuleBuilder.koji_retrying_multicall_map, because
-    we cannot import that method normally because of import loop.
-    """
-    from module_build_service.builder.KojiModuleBuilder import (
-        koji_retrying_multicall_map as multicall,)
-
-    return multicall(*args, **kwargs)
-
-
 class KojiContentGenerator(object):
     """ Class for handling content generator imports of module builds into Koji """
 
     def __init__(self, module, config):
         """
-        :param module: module_build_service.models.ModuleBuild instance.
-        :param config: module_build_service.config.Config instance
+        :param module: module_build_service.common.models.ModuleBuild instance.
+        :param config: module_build_service.common.config.Config instance
         """
         self.owner = module.owner
         self.module = module

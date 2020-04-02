@@ -1,0 +1,22 @@
+---
+users:
+  - username: mbs-user-{{ pipeline_id }}
+    name: MBS User {{ pipeline_id }}
+    ldap_groups:
+      - devel
+
+koji:
+  btypes:
+    - module
+  tags:
+    - name: module-f28
+    - name: module-f28-build
+      arches:
+        - x86_64
+      inheritance:
+        - parent: module-f28
+          priority: 0
+  targets:
+    - name: module-f28
+      build_tag: module-f28-build
+      dest_tag: module-f28

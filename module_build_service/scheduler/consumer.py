@@ -5,7 +5,7 @@ This class reads and processes messages from the message bus it is configured
 to use.
 """
 
-import inspect
+from __future__ import absolute_import
 import itertools
 
 try:
@@ -18,21 +18,46 @@ except ImportError:
 import koji
 import fedmsg.consumers
 import moksha.hub
-import six
 import sqlalchemy.exc
 
-import module_build_service.messaging
-import module_build_service.scheduler.handlers.repos
-import module_build_service.scheduler.handlers.components
-import module_build_service.scheduler.handlers.modules
-import module_build_service.scheduler.handlers.tags
-import module_build_service.scheduler.handlers.greenwave
-import module_build_service.monitor as monitor
+from module_build_service.common import log, conf, models
+from module_build_service.common.errors import IgnoreMessage
+import module_build_service.common.messaging
+from module_build_service.common.messaging import default_messaging_backend
+import module_build_service.common.monitor as monitor
 
-from module_build_service import models, log, conf
-from module_build_service.db_session import db_session
-from module_build_service.scheduler.handlers import greenwave
-from module_build_service.utils import module_build_state_from_msg
+from module_build_service.scheduler import events
+from module_build_service.scheduler.db_session import db_session
+from module_build_service.scheduler.handlers import components, repos, modules, greenwave, tags
+
+
+def no_op_handler(*args, **kwargs):
+    return True
+
+
+ON_BUILD_CHANGE_HANDLERS = {
+    koji.BUILD_STATES["BUILDING"]: no_op_handler,
+    koji.BUILD_STATES["COMPLETE"]: components.build_task_finalize,
+    koji.BUILD_STATES["FAILED"]: components.build_task_finalize,
+    koji.BUILD_STATES["CANCELED"]: components.build_task_finalize,
+    koji.BUILD_STATES["DELETED"]: no_op_handler,
+}
+
+ON_MODULE_CHANGE_HANDLERS = {
+    models.BUILD_STATES["init"]: modules.init,
+    models.BUILD_STATES["wait"]: modules.wait,
+    models.BUILD_STATES["build"]: no_op_handler,
+    models.BUILD_STATES["failed"]: modules.failed,
+    models.BUILD_STATES["done"]: modules.done,
+    # XXX: DIRECT TRANSITION TO READY
+    models.BUILD_STATES["ready"]: no_op_handler,
+    models.BUILD_STATES["garbage"]: no_op_handler,
+}
+
+# Only one kind of repo change event, though...
+ON_REPO_CHANGE_HANDLER = repos.done
+ON_TAG_CHANGE_HANDLER = tags.tagged
+ON_DECISION_UPDATE_HANDLER = greenwave.decision_update
 
 
 class MBSConsumer(fedmsg.consumers.FedmsgConsumer):
@@ -50,10 +75,9 @@ class MBSConsumer(fedmsg.consumers.FedmsgConsumer):
     def __init__(self, hub):
         # Topic setting needs to be done *before* the call to `super`.
 
-        backends = module_build_service.messaging._messaging_backends
         prefixes = conf.messaging_topic_prefix  # This is a list.
-        services = backends[conf.messaging]["services"]
-        suffix = backends[conf.messaging]["topic_suffix"]
+        services = default_messaging_backend["services"]
+        suffix = default_messaging_backend["topic_suffix"]
         self.topic = [
             "{}.{}{}".format(prefix.rstrip("."), category, suffix)
             for prefix, category in itertools.product(prefixes, services)
@@ -80,38 +104,10 @@ class MBSConsumer(fedmsg.consumers.FedmsgConsumer):
 
         # Furthermore, extend our initial messages with any that were queued up
         # in the test environment before our hub was initialized.
-        while module_build_service.messaging._initial_messages:
-            msg = module_build_service.messaging._initial_messages.pop(0)
+        while module_build_service.common.messaging._initial_messages:
+            msg = module_build_service.common.messaging._initial_messages.pop(0)
             self.incoming.put(msg)
 
-        # These are our main lookup tables for figuring out what to run in
-        # response to what messaging events.
-        self.NO_OP = NO_OP = lambda config, msg: True
-        self.on_build_change = {
-            koji.BUILD_STATES["BUILDING"]: NO_OP,
-            koji.BUILD_STATES[
-                "COMPLETE"
-            ]: module_build_service.scheduler.handlers.components.complete,
-            koji.BUILD_STATES["FAILED"]: module_build_service.scheduler.handlers.components.failed,
-            koji.BUILD_STATES[
-                "CANCELED"
-            ]: module_build_service.scheduler.handlers.components.canceled,
-            koji.BUILD_STATES["DELETED"]: NO_OP,
-        }
-        self.on_module_change = {
-            models.BUILD_STATES["init"]: module_build_service.scheduler.handlers.modules.init,
-            models.BUILD_STATES["wait"]: module_build_service.scheduler.handlers.modules.wait,
-            models.BUILD_STATES["build"]: NO_OP,
-            models.BUILD_STATES["failed"]: module_build_service.scheduler.handlers.modules.failed,
-            models.BUILD_STATES["done"]: module_build_service.scheduler.handlers.modules.done,
-            # XXX: DIRECT TRANSITION TO READY
-            models.BUILD_STATES["ready"]: NO_OP,
-            models.BUILD_STATES["garbage"]: NO_OP,
-        }
-        # Only one kind of repo change event, though...
-        self.on_repo_change = module_build_service.scheduler.handlers.repos.done
-        self.on_tag_change = module_build_service.scheduler.handlers.tags.tagged
-        self.on_decision_update = module_build_service.scheduler.handlers.greenwave.decision_update
         self.sanity_check()
 
     def shutdown(self):
@@ -124,12 +120,23 @@ class MBSConsumer(fedmsg.consumers.FedmsgConsumer):
     def validate(self, message):
         if conf.messaging == "fedmsg":
             # If this is a faked internal message, don't bother.
-            if isinstance(message, module_build_service.messaging.BaseMessage):
-                log.info("Skipping crypto validation for %r" % message)
+            if "event" in message:
+                log.info("Skipping crypto validation for %r", message)
                 return
             # Otherwise, if it is a real message from the network, pass it
             # through crypto validation.
             super(MBSConsumer, self).validate(message)
+
+    def validate_event(self, event):
+        if event is None:
+            raise IgnoreMessage("Ignoring the message since it is null")
+        # task_id is required for koji_build_change event
+        if event["event"] == events.KOJI_BUILD_CHANGE and event["task_id"] is None:
+            raise IgnoreMessage(
+                "Ignoring {} event from message {}, which has a null task_id".format(
+                    events.KOJI_BUILD_CHANGE, event["msg_id"]
+                )
+            )
 
     def consume(self, message):
         monitor.messaging_rx_counter.inc()
@@ -139,14 +146,22 @@ class MBSConsumer(fedmsg.consumers.FedmsgConsumer):
         # messages, then just use them as-is.  If they are not already
         # instances of our message abstraction base class, then first transform
         # them before proceeding.
-        if isinstance(message, module_build_service.messaging.BaseMessage):
-            msg = message
+        if "event" in message:
+            event_info = message
         else:
-            msg = self.get_abstracted_msg(message)
+            try:
+                event_info = self.get_abstracted_event_info(message)
+                self.validate_event(event_info)
+            except IgnoreMessage as e:
+                log.debug(str(e))
+                return
+
+        if event_info is None:
+            return
 
         # Primary work is done here.
         try:
-            self.process_message(msg)
+            self.process_message(event_info)
             monitor.messaging_rx_processed_ok_counter.inc()
         except sqlalchemy.exc.OperationalError as error:
             monitor.messaging_rx_failed_counter.inc()
@@ -164,13 +179,11 @@ class MBSConsumer(fedmsg.consumers.FedmsgConsumer):
         if self.stop_condition and self.stop_condition(message):
             self.shutdown()
 
-    def get_abstracted_msg(self, message):
-        parser = module_build_service.messaging._messaging_backends[conf.messaging].get("parser")
+    @staticmethod
+    def get_abstracted_event_info(message):
+        parser = default_messaging_backend.get("parser")
         if parser:
-            try:
-                return parser.parse(message)
-            except module_build_service.messaging.IgnoreMessage:
-                pass
+            return parser.parse(message)
         else:
             raise ValueError("{0} backend does not define a message parser".format(conf.messaging))
 
@@ -178,83 +191,91 @@ class MBSConsumer(fedmsg.consumers.FedmsgConsumer):
         """ On startup, make sure our implementation is sane. """
         # Ensure we have every state covered
         for state in models.BUILD_STATES:
-            if models.BUILD_STATES[state] not in self.on_module_change:
+            if models.BUILD_STATES[state] not in ON_MODULE_CHANGE_HANDLERS:
                 raise KeyError("Module build states %r not handled." % state)
         for state in koji.BUILD_STATES:
-            if koji.BUILD_STATES[state] not in self.on_build_change:
+            if koji.BUILD_STATES[state] not in ON_BUILD_CHANGE_HANDLERS:
                 raise KeyError("Koji build states %r not handled." % state)
 
-        all_fns = list(self.on_build_change.items()) + list(self.on_module_change.items())
-        for key, callback in all_fns:
-            expected = ["config", "msg"]
-            if six.PY2:
-                argspec = inspect.getargspec(callback)[0]
-            else:
-                argspec = inspect.getfullargspec(callback)[0]
-            if argspec != expected:
-                raise ValueError(
-                    "Callback %r, state %r has argspec %r!=%r" % (callback, key, argspec, expected))
-
-    def _map_message(self, db_session, msg):
+    def _map_message(self, db_session, event_info):
         """Map message to its corresponding event handler and module build"""
 
-        if isinstance(msg, module_build_service.messaging.KojiBuildChange):
-            handler = self.on_build_change[msg.build_new_state]
-            build = models.ComponentBuild.from_component_event(db_session, msg)
+        event = event_info["event"]
+
+        if event == events.KOJI_BUILD_CHANGE:
+            handler = ON_BUILD_CHANGE_HANDLERS[event_info["build_new_state"]]
+            build = models.ComponentBuild.from_component_event(
+                db_session, event_info["task_id"], event_info["module_build_id"])
             if build:
                 build = build.module_build
             return handler, build
 
-        if isinstance(msg, module_build_service.messaging.KojiRepoChange):
+        if event == events.KOJI_REPO_CHANGE:
             return (
-                self.on_repo_change,
-                models.ModuleBuild.from_repo_done_event(db_session, msg)
+                ON_REPO_CHANGE_HANDLER,
+                models.ModuleBuild.get_by_tag(db_session, event_info["tag_name"])
             )
 
-        if isinstance(msg, module_build_service.messaging.KojiTagChange):
+        if event == events.KOJI_TAG_CHANGE:
             return (
-                self.on_tag_change,
-                models.ModuleBuild.from_tag_change_event(db_session, msg)
+                ON_TAG_CHANGE_HANDLER,
+                models.ModuleBuild.get_by_tag(db_session, event_info["tag_name"])
             )
 
-        if isinstance(msg, module_build_service.messaging.MBSModule):
+        if event == events.MBS_MODULE_STATE_CHANGE:
+            state = event_info["module_build_state"]
+            valid_module_build_states = list(models.BUILD_STATES.values())
+            if state not in valid_module_build_states:
+                raise ValueError("state={}({}) is not in {}.".format(
+                    state, type(state), valid_module_build_states
+                ))
             return (
-                self.on_module_change[module_build_state_from_msg(msg)],
-                models.ModuleBuild.from_module_event(db_session, msg)
+                ON_MODULE_CHANGE_HANDLERS[state],
+                models.ModuleBuild.get_by_id(db_session, event_info["module_build_id"])
             )
 
-        if isinstance(msg, module_build_service.messaging.GreenwaveDecisionUpdate):
+        if event == events.GREENWAVE_DECISION_UPDATE:
             return (
-                self.on_decision_update,
-                greenwave.get_corresponding_module_build(msg.subject_identifier)
+                ON_DECISION_UPDATE_HANDLER,
+                greenwave.get_corresponding_module_build(event_info["subject_identifier"])
             )
 
         return None, None
 
-    def process_message(self, msg):
+    def process_message(self, event_info):
         # Choose a handler for this message
-        handler, build = self._map_message(db_session, msg)
+        handler, build = self._map_message(db_session, event_info)
 
         if handler is None:
-            log.debug("No event handler associated with msg %s", msg.msg_id)
+            log.debug("No event handler associated with msg %s", event_info["msg_id"])
             return
 
-        idx = "%s: %s, %s" % (handler.__name__, type(msg).__name__, msg.msg_id)
+        idx = "%s: %s, %s" % (
+            handler.__name__, event_info["event"], event_info["msg_id"])
 
-        if handler is self.NO_OP:
+        if handler is no_op_handler:
             log.debug("Handler is NO_OP: %s", idx)
             return
 
         if not build:
-            log.debug("No module associated with msg %s", msg.msg_id)
+            log.debug("No module associated with msg %s", event_info["msg_id"])
             return
 
         MBSConsumer.current_module_build_id = build.id
 
         log.info("Calling %s", idx)
 
+        kwargs = event_info.copy()
+        kwargs.pop("event")
+
         try:
-            further_work = handler(conf, msg) or []
+            if conf.celery_broker_url:
+                # handlers are also Celery tasks, when celery_broker_url is configured,
+                # call "delay" method to run the handlers as Celery async tasks
+                func = getattr(handler, "delay")
+                func(**kwargs)
+            else:
+                handler(**kwargs)
         except Exception as e:
             log.exception("Could not process message handler.")
             db_session.rollback()
@@ -270,16 +291,6 @@ class MBSConsumer(fedmsg.consumers.FedmsgConsumer):
 
             # Allow caller to do something when error is occurred.
             raise
-        else:
-            # Handlers can *optionally* return a list of fake messages that
-            # should be re-inserted back into the main work queue. We can use
-            # this (for instance) when we submit a new component build but (for
-            # some reason) it has already been built, then it can fake its own
-            # completion back to the scheduler so that work resumes as if it
-            # was submitted for real and koji announced its completion.
-            for event in further_work:
-                log.info("  Scheduling faked event %r", event)
-                self.incoming.put(event)
         finally:
             MBSConsumer.current_module_build_id = None
             log.debug("Done with %s", idx)
@@ -302,9 +313,3 @@ def work_queue_put(msg):
     """ Artificially put a message into the work queue of the consumer. """
     consumer = get_global_consumer()
     consumer.incoming.put(msg)
-
-
-def fake_repo_done_message(tag_name):
-    msg = module_build_service.messaging.KojiRepoChange(
-        msg_id="a faked internal message", repo_tag=tag_name + "-build")
-    work_queue_put(msg)

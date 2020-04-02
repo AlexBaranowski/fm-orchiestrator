@@ -14,8 +14,8 @@ from alembic import op
 import sqlalchemy as sa
 
 # Data migration imports
-from module_build_service import Modulemd
 import hashlib
+from module_build_service.common.modulemd import Modulemd
 
 
 modulebuild = sa.Table(

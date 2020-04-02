@@ -1,31 +1,36 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
-import functools
-import os
+from __future__ import absolute_import
 from datetime import datetime, timedelta
-from mock import patch
-from six import string_types
-import time
+import functools
 import hashlib
+import itertools
+import os
+import re
+import six
+import time
 from traceback import extract_stack
-from module_build_service.utils import to_text_type, load_mmd
 
 import koji
+from mock import patch
+from six import string_types
+
 import module_build_service
 from module_build_service import db
-from module_build_service.utils import get_rpm_release, import_mmd, mmd_to_str
-from module_build_service.config import init_config
-from module_build_service.models import (
-    ModuleBuild, ModuleArch, ComponentBuild, VirtualStream,
+from module_build_service.builder.utils import get_rpm_release
+from module_build_service.common.models import (
     BUILD_STATES,
+    ComponentBuild,
+    ModuleArch,
+    ModuleBuild,
+    VirtualStream,
 )
-from module_build_service import Modulemd
-from module_build_service.db_session import db_session
+from module_build_service.common.modulemd import Modulemd
+from module_build_service.common.utils import load_mmd, import_mmd, mmd_to_str, to_text_type
+from module_build_service.scheduler.db_session import db_session
 
 
 base_dir = os.path.dirname(__file__)
-app = module_build_service.app
-conf = init_config(app)
 
 
 def staged_data_filename(filename):
@@ -53,10 +58,10 @@ def read_staged_data(yaml_name):
 def patch_config():
     # add test builders for all resolvers
     with_test_builders = dict()
-    for k, v in module_build_service.config.SUPPORTED_RESOLVERS.items():
+    for k, v in module_build_service.common.config.SUPPORTED_RESOLVERS.items():
         v["builders"].extend(["test", "testlocal"])
         with_test_builders[k] = v
-    patch("module_build_service.config.SUPPORTED_RESOLVERS", with_test_builders)
+    patch("module_build_service.common.config.SUPPORTED_RESOLVERS", with_test_builders)
 
 
 patch_config()
@@ -115,7 +120,7 @@ def clean_database(add_platform_module=True, add_default_arches=True):
     db.create_all()
 
     if add_default_arches:
-        arch_obj = module_build_service.models.ModuleArch(name="x86_64")
+        arch_obj = module_build_service.common.models.ModuleArch(name="x86_64")
         db.session.add(arch_obj)
         db.session.commit()
 
@@ -163,7 +168,8 @@ def _populate_data(data_size=10, contexts=False, scratch=False):
     # like "Object '<ModuleBuild at 0x7f4ccc805c50>' is already attached to
     # session '275' (this is '276')" when add new module build object to passed
     # session.
-    arch = db_session.query(module_build_service.models.ModuleArch).get(1)
+    task_id_counter = itertools.count(1)
+    arch = db_session.query(module_build_service.common.models.ModuleArch).get(1)
     num_contexts = 2 if contexts else 1
     for index in range(data_size):
         for context in range(num_contexts):
@@ -212,7 +218,7 @@ def _populate_data(data_size=10, contexts=False, scratch=False):
                     scmurl="git://pkgs.domain.local/rpms/nginx?"
                            "#ga95886c8a443b36a9ce31abda1f9bed22f2f8c3",
                     format="rpms",
-                    task_id=12312345 + index,
+                    task_id=six.next(task_id_counter),
                     state=koji.BUILD_STATES["COMPLETE"],
                     nvr="nginx-1.10.1-2.{0}".format(build_one_component_release),
                     batch=1,
@@ -224,7 +230,7 @@ def _populate_data(data_size=10, contexts=False, scratch=False):
                     scmurl="/tmp/module_build_service-build-macrosWZUPeK/SRPMS/"
                            "module-build-macros-0.1-1.module_nginx_1_2.src.rpm",
                     format="rpms",
-                    task_id=12312321 + index,
+                    task_id=six.next(task_id_counter),
                     state=koji.BUILD_STATES["COMPLETE"],
                     nvr="module-build-macros-01-1.{0}".format(build_one_component_release),
                     batch=2,
@@ -341,7 +347,7 @@ def scheduler_init_data(tangerine_state=None, scratch=False):
     mmd = load_mmd(read_staged_data("formatted_testmodule"))
     mmd.get_rpm_component("tangerine").set_buildorder(0)
 
-    module_build = module_build_service.models.ModuleBuild(
+    module_build = module_build_service.common.models.ModuleBuild(
         name="testmodule",
         stream="master",
         version='20170109091357',
@@ -366,16 +372,16 @@ def scheduler_init_data(tangerine_state=None, scratch=False):
     db_session.add(module_build)
     db_session.commit()
 
-    platform_br = module_build_service.models.ModuleBuild.get_by_id(db_session, 1)
+    platform_br = module_build_service.common.models.ModuleBuild.get_by_id(db_session, 1)
     module_build.buildrequires.append(platform_br)
 
-    arch = db_session.query(module_build_service.models.ModuleArch).get(1)
+    arch = db_session.query(module_build_service.common.models.ModuleArch).get(1)
     module_build.arches.append(arch)
 
     build_one_component_release = get_rpm_release(db_session, module_build)
 
     db_session.add_all([
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=module_build.id,
             package="perl-Tangerine",
             scmurl="https://src.fedoraproject.org/rpms/perl-Tangerine"
@@ -389,7 +395,7 @@ def scheduler_init_data(tangerine_state=None, scratch=False):
             tagged=True,
             tagged_in_final=True,
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=module_build.id,
             package="perl-List-Compare",
             scmurl="https://src.fedoraproject.org/rpms/perl-List-Compare"
@@ -403,7 +409,7 @@ def scheduler_init_data(tangerine_state=None, scratch=False):
             tagged=True,
             tagged_in_final=True,
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=module_build.id,
             package="tangerine",
             scmurl="https://src.fedoraproject.org/rpms/tangerine"
@@ -419,7 +425,7 @@ def scheduler_init_data(tangerine_state=None, scratch=False):
             tagged=tangerine_state == koji.BUILD_STATES["COMPLETE"],
             tagged_in_final=tangerine_state == koji.BUILD_STATES["COMPLETE"],
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=module_build.id,
             package="module-build-macros",
             scmurl="/tmp/module_build_service-build-macrosqr4AWH/SRPMS/module-build-"
@@ -488,10 +494,18 @@ def make_module(
     if arches:
         assert store_to_db
 
-    name, stream, version, context = nsvc.split(":")
+    nsvc_regex = re.compile(r"([^:]+):([^:]+):([^:]+)(?::(.+))?")
+
+    match = nsvc_regex.match(nsvc)
+    if not match:
+        raise ValueError('Argument nsvc is not in format N:S:V or N:S:V:C')
+
+    name, stream, version, context = match.groups()
+
     mmd = Modulemd.ModuleStreamV2.new(name, stream)
     mmd.set_version(int(version))
-    mmd.set_context(context)
+    if context:
+        mmd.set_context(context)
     mmd.set_summary("foo")
     # Test unicode in mmd.
     mmd.set_description(u"foo \u2019s")

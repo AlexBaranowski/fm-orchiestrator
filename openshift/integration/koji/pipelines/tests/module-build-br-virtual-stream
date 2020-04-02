@@ -1,0 +1,71 @@
+#!/bin/bash -ex
+
+# expected environment variables:
+# CACERT = filepath with CA cert
+# MBS_FRONTEND_HOST
+# KOJI_CONFIG = path to koji configuration
+
+# Kerberos ticket with user having permissions to build module
+
+if [ -z "$CACERT" ] || [ -z "$MBS_FRONTEND_HOST" ] || [ -z "$KOJI_CONFIG" ] || ! klist &>/dev/null ; then
+    echo "Missing environment configuration"
+    exit 1
+fi
+
+RESPONSE=$(mktemp)
+HTTP_CODE=$(mktemp)
+MODULE_REQUEST=$(mktemp)
+
+cat > $MODULE_REQUEST << EOF
+{ "modulemd": "$(sed 's/$/\\n/' ${TEST_DIR}/modulemd.yaml | tr -d '\n')"}
+EOF
+
+curl -s --negotiate -u : \
+     --cacert $CACERT \
+     -H 'Content-Type: application/json' \
+     -H 'Accept: application/json' \
+     -d @$MODULE_REQUEST \
+     -o $RESPONSE \
+     -w '%{http_code}' \
+     https://${MBS_FRONTEND_HOST}/module-build-service/1/module-builds/ > $HTTP_CODE
+
+if [ "$(cat $HTTP_CODE)" != "201" ]; then
+    echo "HTTP code was $(cat $HTTP_CODE), not 201"
+    exit 1
+fi
+
+MODULE_ID=$(jq '.id' $RESPONSE)
+i=0
+while true; do
+    sleep 5
+    i=$((i + 1))
+    if [ $i -gt 100 ]; then
+        echo "Module build has timed out"
+        exit 1
+    fi
+    curl -s --cacert $CACERT \
+         -o $RESPONSE \
+         -w '%{stderr}%{http_code}' \
+         https://${MBS_FRONTEND_HOST}/module-build-service/1/module-builds/$MODULE_ID 2> $HTTP_CODE
+    if [ "$(cat $HTTP_CODE)" != "200" ]; then
+        echo "HTTP code was $(cat $HTTP_CODE), not 200"
+        exit 1
+    fi
+    STATE=$(jq -r '.state_name' $RESPONSE)
+    if [ "$STATE" == "failed" ]; then
+        echo "Module build failed"
+        exit 1
+    elif [ "$STATE" == "ready" ]; then
+        echo "Module build is ready"
+    else
+        continue
+    fi
+    BR_PLATFORM_STREAM=$(jq -r '.buildrequires.platform.stream' $RESPONSE)
+    if [ "${BR_PLATFORM_STREAM}" != "f28" ]; then
+        echo "Module $MODULE_ID buildrequires platform:${BR_PLATFORM_STREAM}, \
+          but it should buildrequire platform:f28"
+        exit 1
+    fi
+    echo "All tests passed"
+    break
+done

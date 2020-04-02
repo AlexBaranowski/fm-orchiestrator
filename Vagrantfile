@@ -8,6 +8,7 @@ $script = <<SCRIPT
     source /etc/profile.d/module_build_service_developer_env.sh
     dnf install -y \
       bash-completion \
+      python3-celery \
       python3-flake8 \
       python3-mock \
       python3-pytest \

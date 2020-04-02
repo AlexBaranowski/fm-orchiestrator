@@ -1,42 +1,125 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
-import koji
+from __future__ import absolute_import
+from datetime import datetime, timedelta
+import hashlib
+import itertools
+import json
 import os
-import re
 from os import path, mkdir
 from os.path import dirname
-from shutil import copyfile
-from datetime import datetime, timedelta
+import re
+import sched
 from random import randint
-import hashlib
+from shutil import copyfile
 
-import module_build_service.messaging
-import module_build_service.scheduler.consumer
-import module_build_service.scheduler.handlers.repos
-import module_build_service.utils
-from module_build_service.errors import Forbidden
-from module_build_service import models, conf, build_logs
-from module_build_service.db_session import db_session
-from module_build_service.scheduler import make_simple_stop_condition
-
-from mock import patch, PropertyMock, Mock, MagicMock
-from werkzeug.datastructures import FileStorage
+import fedmsg
 import kobo
+import koji
+from mock import patch, PropertyMock, Mock, MagicMock
+import moksha.hub
 import pytest
+from werkzeug.datastructures import FileStorage
 
-import json
-import itertools
-
-from module_build_service.builder.base import GenericBuilder
+from module_build_service import app
+from module_build_service.builder import GenericBuilder
 from module_build_service.builder.KojiModuleBuilder import KojiModuleBuilder
-from module_build_service.messaging import MBSModule
-from tests import (
-    app, clean_database, read_staged_data, staged_data_filename
+from module_build_service.builder.MockModuleBuilder import load_local_builds
+from module_build_service.builder.utils import get_rpm_release, validate_koji_tag
+from module_build_service.common import conf, log, build_logs, models
+from module_build_service.common.errors import Forbidden
+from module_build_service.common.utils import load_mmd, import_mmd
+from module_build_service.scheduler import events
+from module_build_service.scheduler.db_session import db_session
+import module_build_service.scheduler.consumer
+from module_build_service.scheduler.handlers.components import (
+    build_task_finalize as build_task_finalize_handler
 )
+import module_build_service.scheduler.handlers.repos
+from module_build_service.scheduler.handlers.repos import done as repos_done_handler
+from module_build_service.scheduler.handlers.tags import tagged as tagged_handler
+from tests import clean_database, read_staged_data, staged_data_filename
 
 base_dir = dirname(dirname(__file__))
 
 user = ("Homer J. Simpson", {"packager"})
+
+
+def make_simple_stop_condition():
+    """ Return a simple stop_condition callable.
+
+    Intended to be used with the main() function here in manage.py and tests.
+
+    The stop_condition returns true when the latest module build enters the any
+    of the finished states.
+    """
+    def stop_condition(message):
+        # XXX - We ignore the message here and instead just query the DB.
+
+        # Grab the latest module build.
+        module = (
+            db_session.query(models.ModuleBuild)
+            .order_by(models.ModuleBuild.id.desc())
+            .first()
+        )
+        done = (
+            models.BUILD_STATES["failed"],
+            models.BUILD_STATES["ready"],
+            models.BUILD_STATES["done"],
+        )
+        result = module.state in done
+        log.debug("stop_condition checking %r, got %r" % (module, result))
+
+        # moksha.hub.main starts the hub and runs it in a separate thread. When
+        # the result is True, remove the db_session from that thread local so
+        # that any pending queries in the transaction will not block other
+        # queries made from other threads.
+        # This is useful for testing particularly.
+        if result:
+            db_session.remove()
+
+        return result
+
+    return stop_condition
+
+
+def main(initial_messages, stop_condition):
+    """ Run the consumer until some condition is met.
+
+    Setting stop_condition to None will run the consumer forever.
+    """
+
+    config = fedmsg.config.load_config()
+    config["mbsconsumer"] = True
+    config["mbsconsumer.stop_condition"] = stop_condition
+    config["mbsconsumer.initial_messages"] = initial_messages
+
+    # Moksha requires that we subscribe to *something*, so tell it /dev/null
+    # since we'll just be doing in-memory queue-based messaging for this single
+    # build.
+    config["zmq_enabled"] = True
+    config["zmq_subscribe_endpoints"] = "ipc:///dev/null"
+
+    # Lazy import consumer to avoid potential import cycle.
+    # For example, in some cases, importing event message from events.py would
+    # cause importing the consumer module, which then starts to import relative
+    # code inside handlers module, and the original code is imported eventually.
+    import module_build_service.scheduler.consumer
+
+    consumers = [module_build_service.scheduler.consumer.MBSConsumer]
+
+    # Note that the hub we kick off here cannot send any message.  You
+    # should use fedmsg.publish(...) still for that.
+    moksha.hub.main(
+        # Pass in our config dict
+        options=config,
+        # Only run the specified consumers if any are so specified.
+        consumers=consumers,
+        # Do not run default producers.
+        producers=[],
+        # Tell moksha to quiet its logging.
+        framework=False,
+    )
 
 
 class FakeSCM(object):
@@ -99,7 +182,7 @@ class FakeModuleBuilder(GenericBuilder):
     on_buildroot_add_repos_cb = None
     on_get_task_info_cb = None
 
-    @module_build_service.utils.validate_koji_tag("tag_name")
+    @validate_koji_tag("tag_name")
     def __init__(self, db_session, owner, module, config, tag_name, components):
         self.db_session = db_session
         self.module_str = module
@@ -185,15 +268,9 @@ class FakeModuleBuilder(GenericBuilder):
             FakeModuleBuilder.on_buildroot_add_artifacts_cb(self, artifacts, install)
         if self.backend == "test":
             for nvr in artifacts:
-                # buildroot_add_artifacts received a list of NVRs, but the tag message expects the
-                # component name. At this point, the NVR may not be set if we are trying to reuse
-                # all components, so we can't search the database. We must parse the package name
-                # from the nvr and then tag it in the build tag. Kobo doesn't work when parsing
-                # the NVR of a component with a module dist-tag, so we must manually do it.
-                package_name = nvr.split(".module")[0].rsplit("-", 2)[0]
                 # When INSTANT_COMPLETE is on, the components are already in the build tag
                 if self.INSTANT_COMPLETE is False:
-                    self._send_tag(package_name, nvr, dest_tag=False)
+                    self._send_tag(nvr, dest_tag=False)
         elif self.backend == "testlocal":
             self._send_repo_done()
 
@@ -209,10 +286,7 @@ class FakeModuleBuilder(GenericBuilder):
             for nvr in artifacts:
                 # tag_artifacts received a list of NVRs, but the tag message expects the
                 # component name
-                from sqlalchemy.orm import load_only
-                artifact = self.db_session.query(models.ComponentBuild).filter_by(
-                    nvr=nvr).options(load_only("package")).first().package
-                self._send_tag(artifact, nvr, dest_tag=dest_tag)
+                self._send_tag(nvr, dest_tag=dest_tag)
 
     @property
     def koji_session(self):
@@ -232,32 +306,20 @@ class FakeModuleBuilder(GenericBuilder):
         return {"name": self.tag_name + "-build"}
 
     def _send_repo_done(self):
-        msg = module_build_service.messaging.KojiRepoChange(
-            msg_id="a faked internal message", repo_tag=self.tag_name + "-build")
-        module_build_service.scheduler.consumer.work_queue_put(msg)
+        events.scheduler.add(repos_done_handler, ("fake_msg", self.tag_name + "-build"))
 
-    def _send_tag(self, artifact, nvr, dest_tag=True):
+    def _send_tag(self, nvr, dest_tag=True):
         if dest_tag:
             tag = self.tag_name
         else:
             tag = self.tag_name + "-build"
-        msg = module_build_service.messaging.KojiTagChange(
-            msg_id="a faked internal message", tag=tag, artifact=artifact, nvr=nvr)
-        module_build_service.scheduler.consumer.work_queue_put(msg)
+        events.scheduler.add(tagged_handler, ("a faked internal message", tag, nvr))
 
     def _send_build_change(self, state, name, build_id):
         # build_id=1 and task_id=1 are OK here, because we are building just
         # one RPM at the time.
-        msg = module_build_service.messaging.KojiBuildChange(
-            msg_id="a faked internal message",
-            build_id=build_id,
-            task_id=build_id,
-            build_name=name,
-            build_new_state=state,
-            build_release="1",
-            build_version="1",
-        )
-        module_build_service.scheduler.consumer.work_queue_put(msg)
+        args = ("a faked internal message", build_id, state, name, "1", "1", None, None)
+        events.scheduler.add(build_task_finalize_handler, args)
 
     def build(self, artifact_name, source):
         print("Starting building artifact %s: %s" % (artifact_name, source))
@@ -286,10 +348,8 @@ class FakeModuleBuilder(GenericBuilder):
         pass
 
     def recover_orphaned_artifact(self, component_build):
-        msgs = []
         if self.INSTANT_COMPLETE:
-            disttag = module_build_service.utils.get_rpm_release(
-                self.db_session, component_build.module_build)
+            disttag = get_rpm_release(self.db_session, component_build.module_build)
             # We don't know the version or release, so just use a random one here
             nvr = "{0}-1.0-1.{1}".format(component_build.package, disttag)
             component_build.state = koji.BUILD_STATES["COMPLETE"]
@@ -298,28 +358,17 @@ class FakeModuleBuilder(GenericBuilder):
             component_build.state_reason = "Found existing build"
             nvr_dict = kobo.rpmlib.parse_nvr(component_build.nvr)
             # Send a message stating the build is complete
-            msgs.append(
-                module_build_service.messaging.KojiBuildChange(
-                    "recover_orphaned_artifact: fake message",
-                    randint(1, 9999999),
-                    component_build.task_id,
-                    koji.BUILD_STATES["COMPLETE"],
-                    component_build.package,
-                    nvr_dict["version"],
-                    nvr_dict["release"],
-                    component_build.module_build.id,
-                )
-            )
+            args = ("recover_orphaned_artifact: fake message",
+                    component_build.task_id, koji.BUILD_STATES["COMPLETE"],
+                    component_build.package, nvr_dict["version"], nvr_dict["release"],
+                    component_build.module_build.id, None)
+            events.scheduler.add(build_task_finalize_handler, args)
             # Send a message stating that the build was tagged in the build tag
-            msgs.append(
-                module_build_service.messaging.KojiTagChange(
-                    "recover_orphaned_artifact: fake message",
+            args = ("recover_orphaned_artifact: fake message",
                     component_build.module_build.koji_tag + "-build",
-                    component_build.package,
-                    component_build.nvr,
-                )
-            )
-        return msgs
+                    component_build.nvr)
+            events.scheduler.add(tagged_handler, args)
+            return True
 
     def finalize(self, succeeded=None):
         if FakeModuleBuilder.on_finalize_cb:
@@ -339,7 +388,7 @@ def cleanup_moksha():
 class BaseTestBuild:
 
     def run_scheduler(self, msgs=None, stop_condition=None):
-        module_build_service.scheduler.main(
+        main(
             msgs or [],
             stop_condition or make_simple_stop_condition()
         )
@@ -347,7 +396,9 @@ class BaseTestBuild:
 
 @patch("module_build_service.scheduler.handlers.modules.handle_stream_collision_modules")
 @patch.object(
-    module_build_service.config.Config, "system", new_callable=PropertyMock, return_value="test"
+    module_build_service.common.config.Config, "system",
+    new_callable=PropertyMock,
+    return_value="test",
 )
 @patch(
     "module_build_service.builder.GenericBuilder.default_buildroot_groups",
@@ -404,12 +455,22 @@ class TestBuild(BaseTestBuild):
         FakeModuleBuilder.on_get_task_info_cb = on_get_task_info_cb
 
         self.p_check_gating = patch(
-            "module_build_service.utils.greenwave.Greenwave.check_gating",
+            "module_build_service.scheduler.greenwave.Greenwave.check_gating",
             return_value=True)
         self.mock_check_gating = self.p_check_gating.start()
 
+        self.patch_config_broker = patch.object(
+            module_build_service.common.config.Config,
+            "celery_broker_url",
+            create=True,
+            new_callable=PropertyMock,
+            return_value=False,
+        )
+        self.patch_config_broker.start()
+
     def teardown_method(self, test_method):
         self.p_check_gating.stop()
+        self.patch_config_broker.stop()
         FakeModuleBuilder.reset()
         cleanup_moksha()
         for i in range(20):
@@ -419,9 +480,9 @@ class TestBuild(BaseTestBuild):
                 pass
 
     @pytest.mark.parametrize("mmd_version", [1, 2])
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
-    def test_submit_build(
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
+    def test_submit_build_normal(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc, mmd_version
     ):
         """
@@ -497,9 +558,9 @@ class TestBuild(BaseTestBuild):
         assert module_build.module_builds_trace[4].state == models.BUILD_STATES["ready"]
         assert len(module_build.module_builds_trace) == 5
 
-    @patch("module_build_service.builder.KojiModuleBuilder.KojiModuleBuilder.get_session")
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.builder.KojiModuleBuilder.get_session")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_buildonly(
         self, mocked_scm, mocked_get_user, mocked_get_session, conf_system, dbg, hmsc
     ):
@@ -566,8 +627,8 @@ class TestBuild(BaseTestBuild):
             ]
 
     @pytest.mark.parametrize("gating_result", (True, False))
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_no_components(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc, gating_result
     ):
@@ -608,13 +669,13 @@ class TestBuild(BaseTestBuild):
             assert module_build.state_reason == "Gating failed"
 
     @patch(
-        "module_build_service.config.Config.check_for_eol",
+        "module_build_service.common.config.Config.check_for_eol",
         new_callable=PropertyMock,
         return_value=True,
     )
-    @patch("module_build_service.utils.submit._is_eol_in_pdc", return_value=True)
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.common.submit._is_eol_in_pdc", return_value=True)
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_eol_module(
         self, mocked_scm, mocked_get_user, is_eol, check, conf_system, dbg, hmsc
     ):
@@ -639,8 +700,8 @@ class TestBuild(BaseTestBuild):
         assert data["status"] == 400
         assert data["message"] == u"Module python3:master is marked as EOL in PDC."
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_from_yaml_not_allowed(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -650,7 +711,7 @@ class TestBuild(BaseTestBuild):
         yaml = read_staged_data("testmodule")
 
         with patch.object(
-            module_build_service.config.Config,
+            module_build_service.common.config.Config,
             "yaml_submit_allowed",
             new_callable=PropertyMock,
             return_value=False,
@@ -664,8 +725,8 @@ class TestBuild(BaseTestBuild):
             assert data["status"] == 403
             assert data["message"] == "YAML submission is not enabled"
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_from_yaml_allowed(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -673,7 +734,7 @@ class TestBuild(BaseTestBuild):
             mocked_scm, "testmodule", "testmodule.yaml", "620ec77321b2ea7b0d67d82992dda3e1d67055b4")
 
         with patch.object(
-            module_build_service.config.Config,
+            module_build_service.common.config.Config,
             "yaml_submit_allowed",
             new_callable=PropertyMock,
             return_value=True,
@@ -694,8 +755,8 @@ class TestBuild(BaseTestBuild):
         module_build = models.ModuleBuild.get_by_id(db_session, module_build_id)
         assert module_build.state == models.BUILD_STATES["ready"]
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_cancel(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -756,8 +817,8 @@ class TestBuild(BaseTestBuild):
             if build.task_id:
                 assert build.task_id in cancelled_tasks
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_instant_complete(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -792,10 +853,10 @@ class TestBuild(BaseTestBuild):
                 models.BUILD_STATES["ready"],
             ]
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     @patch(
-        "module_build_service.config.Config.num_concurrent_builds",
+        "module_build_service.common.config.Config.num_concurrent_builds",
         new_callable=PropertyMock,
         return_value=1,
     )
@@ -851,15 +912,16 @@ class TestBuild(BaseTestBuild):
                 models.BUILD_STATES["ready"],
             ]
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     @patch(
-        "module_build_service.config.Config.num_concurrent_builds",
+        "module_build_service.common.config.Config.num_concurrent_builds",
         new_callable=PropertyMock,
         return_value=2,
     )
+    @patch('module_build_service.scheduler.events.Scheduler.run', autospec=True)
     def test_try_to_reach_concurrent_threshold(
-        self, conf_num_concurrent_builds, mocked_scm, mocked_get_user,
+        self, scheduler_run, conf_num_concurrent_builds, mocked_scm, mocked_get_user,
         conf_system, dbg, hmsc
     ):
         """
@@ -886,24 +948,21 @@ class TestBuild(BaseTestBuild):
         # the module build.
         TestBuild._global_var = []
 
-        def stop(message):
+        def mocked_scheduler_run(self):
             """
-            Stop the scheduler when the module is built or when we try to build
-            more components than the num_concurrent_builds.
+            Store the number of concurrent builds between each handler call to global list so we
+            can examine it later.
             """
-            main_stop = module_build_service.scheduler.make_simple_stop_condition()
             num_building = (
                 db_session.query(models.ComponentBuild)
                 .filter_by(state=koji.BUILD_STATES["BUILDING"])
                 .count()
             )
-            over_threshold = conf.num_concurrent_builds < num_building
             TestBuild._global_var.append(num_building)
-            result = main_stop(message) or over_threshold
-            db_session.remove()
-            return result
+            sched.scheduler.run(self)
 
-        self.run_scheduler(stop_condition=stop)
+        scheduler_run.side_effect = mocked_scheduler_run
+        self.run_scheduler()
 
         # _global_var looks similar to this: [0, 1, 0, 0, 2, 2, 1, 0, 0, 0]
         # It shows the number of concurrent builds in the time. At first we
@@ -918,10 +977,10 @@ class TestBuild(BaseTestBuild):
         num_builds = [k for k, g in itertools.groupby(TestBuild._global_var)]
         assert num_builds.count(1) == 2
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     @patch(
-        "module_build_service.config.Config.num_concurrent_builds",
+        "module_build_service.common.config.Config.num_concurrent_builds",
         new_callable=PropertyMock,
         return_value=1,
     )
@@ -987,10 +1046,10 @@ class TestBuild(BaseTestBuild):
             # there were failed components in batch 2.
             assert c.module_build.batch == 2
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     @patch(
-        "module_build_service.config.Config.num_concurrent_builds",
+        "module_build_service.common.config.Config.num_concurrent_builds",
         new_callable=PropertyMock,
         return_value=1,
     )
@@ -1047,8 +1106,8 @@ class TestBuild(BaseTestBuild):
             assert c.module_build.batch == 2
 
     @pytest.mark.usefixtures("reuse_component_init_data")
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_reuse_all(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -1089,10 +1148,17 @@ class TestBuild(BaseTestBuild):
 
         FakeModuleBuilder.on_buildroot_add_artifacts_cb = on_buildroot_add_artifacts_cb
 
-        from module_build_service.db_session import db_session
+        from module_build_service.scheduler.db_session import db_session
 
         # Create a dedicated database session for scheduler to avoid hang
-        self.run_scheduler(msgs=[MBSModule("local module build", 3, 1)])
+        self.run_scheduler(
+            msgs=[{
+                "msg_id": "local module build",
+                "event": events.MBS_MODULE_STATE_CHANGE,
+                "module_build_id": 3,
+                "module_build_state": 1
+            }]
+        )
 
         reused_component_ids = {
             "module-build-macros": None,
@@ -1112,8 +1178,8 @@ class TestBuild(BaseTestBuild):
             assert build.reused_component_id == reused_component_ids[build.package]
 
     @pytest.mark.usefixtures("reuse_component_init_data")
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_reuse_all_without_build_macros(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -1123,7 +1189,7 @@ class TestBuild(BaseTestBuild):
         """
         # Firstly, remove all existing module-build-macros component builds
 
-        from module_build_service.db_session import db_session
+        from module_build_service.scheduler.db_session import db_session
 
         macros_cb_query = db_session.query(models.ComponentBuild).filter_by(
             package="module-build-macros")
@@ -1171,7 +1237,14 @@ class TestBuild(BaseTestBuild):
 
         FakeModuleBuilder.on_buildroot_add_artifacts_cb = on_buildroot_add_artifacts_cb
 
-        self.run_scheduler(msgs=[MBSModule("local module build", 3, 1)])
+        self.run_scheduler(
+            msgs=[{
+                "msg_id": "local module build",
+                "event": events.MBS_MODULE_STATE_CHANGE,
+                "module_build_id": 3,
+                "module_build_state": 1
+            }]
+        )
 
         # All components should be built and module itself should be in "done"
         # or "ready" state.
@@ -1183,8 +1256,8 @@ class TestBuild(BaseTestBuild):
             ]
             assert build.package != "module-build-macros"
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_resume(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -1318,8 +1391,8 @@ class TestBuild(BaseTestBuild):
                 models.BUILD_STATES["ready"],
             ]
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_resume_recover_orphaned_macros(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -1439,8 +1512,8 @@ class TestBuild(BaseTestBuild):
                 models.BUILD_STATES["ready"],
             ]
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_resume_failed_init(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -1512,8 +1585,8 @@ class TestBuild(BaseTestBuild):
                 models.BUILD_STATES["ready"],
             ]
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_resume_init_fail(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -1554,10 +1627,10 @@ class TestBuild(BaseTestBuild):
         }
         assert data == expected
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     @patch(
-        "module_build_service.config.Config.modules_allow_scratch",
+        "module_build_service.common.config.Config.modules_allow_scratch",
         new_callable=PropertyMock,
         return_value=True,
     )
@@ -1597,10 +1670,10 @@ class TestBuild(BaseTestBuild):
         # make sure scratch build has expected context with unique suffix
         assert module_build.context == "9c690d0e_1"
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     @patch(
-        "module_build_service.config.Config.modules_allow_scratch",
+        "module_build_service.common.config.Config.modules_allow_scratch",
         new_callable=PropertyMock,
         return_value=True,
     )
@@ -1641,10 +1714,10 @@ class TestBuild(BaseTestBuild):
         # make sure normal build has expected context without suffix
         assert module_build.context == "9c690d0e"
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     @patch(
-        "module_build_service.config.Config.modules_allow_scratch",
+        "module_build_service.common.config.Config.modules_allow_scratch",
         new_callable=PropertyMock,
         return_value=True,
     )
@@ -1683,8 +1756,8 @@ class TestBuild(BaseTestBuild):
         # make sure second scratch build has expected context with unique suffix
         assert module_build.context == "9c690d0e_2"
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_build_repo_regen_not_started_batch(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -1719,7 +1792,7 @@ class TestBuild(BaseTestBuild):
             return result
 
         with patch(
-            "module_build_service.utils.batches.at_concurrent_component_threshold"
+            "module_build_service.scheduler.batches.at_concurrent_component_threshold"
         ) as mock_acct:
             # Once we get to batch 2, then simulate the concurrent threshold being met
             def _at_concurrent_component_threshold(config):
@@ -1741,11 +1814,11 @@ class TestBuild(BaseTestBuild):
         # Simulate a random repo regen message that MBS didn't expect
         cleanup_moksha()
         module = models.ModuleBuild.get_by_id(db_session, module_build_id)
-        msgs = [
-            module_build_service.messaging.KojiRepoChange(
-                msg_id="a faked internal message", repo_tag=module.koji_tag + "-build"
-            )
-        ]
+        events_info = [{
+            "msg_id": "a faked internal message",
+            "event": events.KOJI_REPO_CHANGE,
+            "tag_name": module.koji_tag + "-build"
+        }]
         db_session.expire_all()
         # Stop after processing the seeded message
 
@@ -1753,14 +1826,14 @@ class TestBuild(BaseTestBuild):
             db_session.remove()
             return True
 
-        self.run_scheduler(msgs, stop_condition=stop)
+        self.run_scheduler(events_info, stop_condition=stop)
 
         # Make sure the module build didn't fail so that the poller can resume it later
         module = models.ModuleBuild.get_by_id(db_session, module_build_id)
         assert module.state == models.BUILD_STATES["build"]
 
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     def test_submit_br_metadata_only_module(
         self, mocked_scm, mocked_get_user, conf_system, dbg, hmsc
     ):
@@ -1768,10 +1841,8 @@ class TestBuild(BaseTestBuild):
         Test that when a build is submitted with a buildrequire without a Koji tag,
         MBS doesn't supply it as a dependency to the builder.
         """
-        metadata_mmd = module_build_service.utils.load_mmd(
-            read_staged_data("build_metadata_module")
-        )
-        module_build_service.utils.import_mmd(db_session, metadata_mmd)
+        metadata_mmd = load_mmd(read_staged_data("build_metadata_module"))
+        import_mmd(db_session, metadata_mmd)
 
         FakeSCM(
             mocked_scm,
@@ -1803,7 +1874,9 @@ class TestBuild(BaseTestBuild):
 
 
 @patch(
-    "module_build_service.config.Config.system", new_callable=PropertyMock, return_value="testlocal"
+    "module_build_service.common.config.Config.system",
+    new_callable=PropertyMock,
+    return_value="testlocal",
 )
 class TestLocalBuild(BaseTestBuild):
     def setup_method(self, test_method):
@@ -1823,10 +1896,10 @@ class TestLocalBuild(BaseTestBuild):
                 pass
 
     @patch("module_build_service.scheduler.handlers.modules.handle_stream_collision_modules")
-    @patch("module_build_service.auth.get_user", return_value=user)
-    @patch("module_build_service.scm.SCM")
+    @patch("module_build_service.web.auth.get_user", return_value=user)
+    @patch("module_build_service.common.scm.SCM")
     @patch(
-        "module_build_service.config.Config.mock_resultsdir",
+        "module_build_service.common.config.Config.mock_resultsdir",
         new_callable=PropertyMock,
         return_value=staged_data_filename('local_builds'),
     )
@@ -1836,11 +1909,11 @@ class TestLocalBuild(BaseTestBuild):
         """
         Tests local module build dependency.
         """
-        module_build_service.utils.load_local_builds(["platform"])
+        load_local_builds(["platform:f30"])
         FakeSCM(
             mocked_scm,
             "testmodule",
-            "testmodule.yaml",
+            "testmodule-buildrequires-f30.yaml",
             "620ec77321b2ea7b0d67d82992dda3e1d67055b4",
         )
 

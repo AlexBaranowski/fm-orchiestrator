@@ -40,4 +40,26 @@ have 4 tests running in parallel one could call::
 
     MBS_TEST_WORKERS=4 tox -e integration
 
+Test case and test environment design
+=====================================
+
+Currently each test case is implemented in a separate file.
+
+Test cases interact with the test environment, test configuration, and service
+under test (SUT) through fixtures. These are defined in `conftest.py`_, and
+`pytest takes care`_ to create them.
+
+These fixtures usually instantiate a class from `utils.py`_. These classes are
+intended to wrap the services or data the test cases need to interact with.
+This wrapping creates a layer of abstraction which makes the test cases more
+readable, and should also make updates easier, in case those services or data
+change in the future.
+
+Test cases should check for preconditions (if any) in the test data and test
+environment. This helps to better understand test failures and debug failing
+test cases.
+
 .. _tests/integration/example.test.env.yaml: example.test.env.yaml
+.. _conftest.py: conftest.py
+.. _pytest takes care: https://docs.pytest.org/en/latest/fixture.html#conftest-py-sharing-fixture-functions
+.. _utils.py: utils.py

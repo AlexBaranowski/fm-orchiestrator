@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
+
 from module_build_service.resolver.DBResolver import DBResolver
 
 

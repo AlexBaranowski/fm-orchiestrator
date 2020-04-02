@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
+
+import sqlalchemy
 from sqlalchemy.orm import aliased
 
-from module_build_service import log, db
+from module_build_service.common import log, models
+from module_build_service.common.errors import UnprocessableEntity
+from module_build_service.common.utils import load_mmd
 from module_build_service.resolver.base import GenericResolver
-from module_build_service import models
-from module_build_service.errors import UnprocessableEntity
-from module_build_service.utils.general import load_mmd
-import sqlalchemy
 
 
 class DBResolver(GenericResolver):
@@ -58,7 +59,7 @@ class DBResolver(GenericResolver):
         # Cast the version as an integer so that we get proper ordering
         module = query.order_by(
             models.ModuleBuild.stream_version.desc(),
-            sqlalchemy.cast(models.ModuleBuild.version, db.BigInteger).desc(),
+            sqlalchemy.cast(models.ModuleBuild.version, sqlalchemy.BigInteger).desc(),
         ).first()
 
         if module:
@@ -171,7 +172,7 @@ class DBResolver(GenericResolver):
             module_br_alias.context == c,
         )
         query = query.order_by(
-            sqlalchemy.cast(models.ModuleBuild.version, db.BigInteger).desc())
+            sqlalchemy.cast(models.ModuleBuild.version, sqlalchemy.BigInteger).desc())
         all_builds = query.all()
 
         # The `all_builds` list contains builds sorted by "build.version". We need only
@@ -198,7 +199,7 @@ class DBResolver(GenericResolver):
         Returns a dictionary with keys set according the `keys` parameters and values
         set to the union of all components defined in all installation profiles matching
         the key in all buildrequires. If there are some modules loaded by
-        utils.load_local_builds(...), these local modules will be considered when returning
+        load_local_builds(...), these local modules will be considered when returning
         the profiles.
         :param mmd: Modulemd.ModuleStream instance representing the module
         :param keys: list of modulemd installation profiles to include in the result

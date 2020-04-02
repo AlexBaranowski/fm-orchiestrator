@@ -1,134 +1,47 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
+import contextlib
 import copy
+import datetime
+import glob
+import hashlib
+from itertools import chain
+import locale
 import logging
 import os
-import koji
-import tempfile
-import glob
-import datetime
-import time
-import dogpile.cache
 import random
 import string
-import kobo.rpmlib
-import threading
-import six.moves.xmlrpc_client as xmlrpclib
-import munch
-import locale
-from itertools import chain
-from OpenSSL.SSL import SysCallError
+import tempfile
 import textwrap
+import threading
+import time
 
-from module_build_service import log, conf, models
-import module_build_service.scm
-import module_build_service.utils
-from module_build_service.builder.utils import execute_cmd
-from module_build_service.db_session import db_session
-from module_build_service.errors import ProgrammingError
+import dogpile.cache
+import koji
+import kobo.rpmlib
+from OpenSSL.SSL import SysCallError
 
-from module_build_service.builder.base import GenericBuilder
+from module_build_service.builder import GenericBuilder
 from module_build_service.builder.KojiContentGenerator import KojiContentGenerator
-from module_build_service.utils import get_reusable_components, get_reusable_module, set_locale
+from module_build_service.builder.utils import execute_cmd, get_rpm_release, validate_koji_tag
+from module_build_service.common import log, conf, models
+from module_build_service.common.koji import (
+    get_session, koji_multicall_map, koji_retrying_multicall_map,
+)
+from module_build_service.common.retry import retry
+from module_build_service.scheduler import events
+from module_build_service.scheduler.db_session import db_session
+from module_build_service.scheduler.reuse import get_reusable_components, get_reusable_module
 
 logging.basicConfig(level=logging.DEBUG)
 
 
-def koji_multicall_map(koji_session, koji_session_fnc, list_of_args=None, list_of_kwargs=None):
-    """
-    Calls the `koji_session_fnc` using Koji multicall feature N times based on the list of
-    arguments passed in `list_of_args` and `list_of_kwargs`.
-    Returns list of responses sorted the same way as input args/kwargs. In case of error,
-    the error message is logged and None is returned.
-
-    For example to get the package ids of "httpd" and "apr" packages:
-        ids = koji_multicall_map(session, session.getPackageID, ["httpd", "apr"])
-        # ids is now [280, 632]
-
-    :param KojiSessions koji_session: KojiSession to use for multicall.
-    :param object koji_session_fnc: Python object representing the KojiSession method to call.
-    :param list list_of_args: List of args which are passed to each call of koji_session_fnc.
-    :param list list_of_kwargs: List of kwargs which are passed to each call of koji_session_fnc.
-    """
-    if list_of_args is None and list_of_kwargs is None:
-        raise ProgrammingError("One of list_of_args or list_of_kwargs must be set.")
-
-    if (
-        type(list_of_args) not in [type(None), list]
-        or type(list_of_kwargs) not in [type(None), list]
-    ):
-        raise ProgrammingError("list_of_args and list_of_kwargs must be list or None.")
-
-    if list_of_kwargs is None:
-        list_of_kwargs = [{}] * len(list_of_args)
-    if list_of_args is None:
-        list_of_args = [[]] * len(list_of_kwargs)
-
-    if len(list_of_args) != len(list_of_kwargs):
-        raise ProgrammingError("Length of list_of_args and list_of_kwargs must be the same.")
-
-    koji_session.multicall = True
-    for args, kwargs in zip(list_of_args, list_of_kwargs):
-        if type(args) != list:
-            args = [args]
-        if type(kwargs) != dict:
-            raise ProgrammingError("Every item in list_of_kwargs must be a dict")
-        koji_session_fnc(*args, **kwargs)
-
-    try:
-        responses = koji_session.multiCall(strict=True)
-    except Exception:
-        log.exception(
-            "Exception raised for multicall of method %r with args %r, %r:",
-            koji_session_fnc, args, kwargs,
-        )
-        return None
-
-    if not responses:
-        log.error("Koji did not return response for multicall of %r", koji_session_fnc)
-        return None
-    if type(responses) != list:
-        log.error(
-            "Fault element was returned for multicall of method %r: %r", koji_session_fnc, responses
-        )
-        return None
-
-    results = []
-
-    # For the response specification, see
-    # https://web.archive.org/web/20060624230303/http://www.xmlrpc.com/discuss/msgReader$1208?mode=topic
-    # Relevant part of this:
-    # Multicall returns an array of responses. There will be one response for each call in
-    # the original array. The result will either be a one-item array containing the result value,
-    # or a struct of the form found inside the standard <fault> element.
-    for response, args, kwargs in zip(responses, list_of_args, list_of_kwargs):
-        if type(response) == list:
-            if not response:
-                log.error(
-                    "Empty list returned for multicall of method %r with args %r, %r",
-                    koji_session_fnc, args, kwargs
-                )
-                return None
-            results.append(response[0])
-        else:
-            log.error(
-                "Unexpected data returned for multicall of method %r with args %r, %r: %r",
-                koji_session_fnc, args, kwargs, response
-            )
-            return None
-
-    return results
-
-
-@module_build_service.utils.retry(wait_on=(xmlrpclib.ProtocolError, koji.GenericError))
-def koji_retrying_multicall_map(*args, **kwargs):
-    """
-    Retrying version of koji_multicall_map. This tries to retry the Koji call
-    in case of koji.GenericError or xmlrpclib.ProtocolError.
-
-    Please refer to koji_multicall_map for further specification of arguments.
-    """
-    return koji_multicall_map(*args, **kwargs)
+@contextlib.contextmanager
+def set_locale(*args, **kwargs):
+    saved = locale.setlocale(locale.LC_ALL)
+    yield locale.setlocale(*args, **kwargs)
+    locale.setlocale(locale.LC_ALL, saved)
 
 
 class KojiModuleBuilder(GenericBuilder):
@@ -138,13 +51,13 @@ class KojiModuleBuilder(GenericBuilder):
     _build_lock = threading.Lock()
     region = dogpile.cache.make_region().configure("dogpile.cache.memory")
 
-    @module_build_service.utils.validate_koji_tag("tag_name")
+    @validate_koji_tag("tag_name")
     def __init__(self, db_session, owner, module, config, tag_name, components):
         """
         :param db_session: SQLAlchemy session object.
         :param owner: a string representing who kicked off the builds
-        :param module: module_build_service.models.ModuleBuild instance.
-        :param config: module_build_service.config.Config instance
+        :param module: module_build_service.common.models.ModuleBuild instance.
+        :param config: module_build_service.common.config.Config instance
         :param tag_name: name of tag for given module
         """
         self.db_session = db_session
@@ -158,7 +71,7 @@ class KojiModuleBuilder(GenericBuilder):
         log.debug("Using koji profile %r" % config.koji_profile)
         log.debug("Using koji_config: %s" % config.koji_config)
 
-        self.koji_session = self.get_session(config)
+        self.koji_session = get_session(config)
         self.arches = sorted(arch.name for arch in self.module.arches)
 
         # Allow KojiModuleBuilder to be initialized if no arches are set but the module is in
@@ -182,7 +95,7 @@ class KojiModuleBuilder(GenericBuilder):
     def getPerms(self):
         return dict([(p["name"], p["id"]) for p in self.koji_session.getAllPerms()])
 
-    @module_build_service.utils.retry(wait_on=(IOError, koji.GenericError))
+    @retry(wait_on=(IOError, koji.GenericError))
     def buildroot_ready(self, artifacts=None):
         """
         :param artifacts=None - list of nvrs
@@ -233,7 +146,7 @@ class KojiModuleBuilder(GenericBuilder):
         reusable_module = get_reusable_module(module_build)
         if not reusable_module:
             return filtered_rpms
-        koji_session = KojiModuleBuilder.get_session(conf, login=False)
+        koji_session = get_session(conf, login=False)
         # Get all the RPMs and builds of the reusable module in Koji
         rpms, builds = koji_session.listTaggedRPMS(reusable_module.koji_tag, latest=True)
         # Convert the list to a dict where each key is the build_id
@@ -468,57 +381,42 @@ class KojiModuleBuilder(GenericBuilder):
         return srpm_paths[0]
 
     @staticmethod
-    @module_build_service.utils.retry(wait_on=(xmlrpclib.ProtocolError, koji.GenericError))
-    def get_session(config, login=True):
-        """Create and return a koji.ClientSession object
+    def generate_koji_tag(
+        name, stream, version, context, max_length=256, scratch=False, scratch_id=0,
+    ):
+        """Generate a koji tag for a module
 
-        :param config: the config object returned from :meth:`init_config`.
-        :type config: :class:`Config`
-        :param bool login: whether to log into the session. To login if True
-            is passed, otherwise not to log into session.
-        :return: the Koji session object.
-        :rtype: :class:`koji.ClientSession`
+        Generally, a module's koji tag is in format ``module-N-S-V-C``. However, if
+        it is longer than maximum length, old format ``module-hash`` is used.
+
+        :param str name: a module's name
+        :param str stream: a module's stream
+        :param str version: a module's version
+        :param str context: a module's context
+        :param int max_length: the maximum length the Koji tag can be before
+            falling back to the old format of "module-<hash>". Default is 256
+            characters, which is the maximum length of a tag Koji accepts.
+        :param bool scratch: a flag indicating if the generated tag will be for
+            a scratch module build
+        :param int scratch_id: for scratch module builds, a unique build identifier
+        :return: a Koji tag
+        :rtype: str
         """
-        koji_config = munch.Munch(
-            koji.read_config(profile_name=config.koji_profile, user_config=config.koji_config))
-        # Timeout after 10 minutes.  The default is 12 hours.
-        koji_config["timeout"] = 60 * 10
-
-        address = koji_config.server
-        log.info("Connecting to koji %r.", address)
-        koji_session = koji.ClientSession(address, opts=koji_config)
-
-        if not login:
-            return koji_session
-
-        authtype = koji_config.authtype
-        log.info("Authenticate session with %r.", authtype)
-        if authtype == "kerberos":
-            try:
-                import krbV
-                # We want to create a context per thread to avoid Kerberos cache corruption
-                ctx = krbV.Context()
-            except ImportError:
-                # If no krbV, we can assume GSSAPI auth is available
-                ctx = None
-            keytab = getattr(config, "krb_keytab", None)
-            principal = getattr(config, "krb_principal", None)
-            if not keytab and principal:
-                raise ValueError(
-                    "The Kerberos keytab and principal aren't set for Koji authentication")
-            log.debug("  keytab: %r, principal: %r" % (keytab, principal))
-            # We want to use the thread keyring for the ccache to ensure we have one cache per
-            # thread to avoid Kerberos cache corruption
-            ccache = "KEYRING:thread:mbs"
-            koji_session.krb_login(principal=principal, keytab=keytab, ctx=ctx, ccache=ccache)
-        elif authtype == "ssl":
-            koji_session.ssl_login(
-                os.path.expanduser(koji_config.cert), None, os.path.expanduser(koji_config.serverca)
-            )
+        if scratch:
+            prefix = "scrmod-"
+            # use unique suffix so same commit can be resubmitted
+            suffix = "+" + str(scratch_id)
         else:
-            raise ValueError("Unrecognized koji authtype %r" % authtype)
-
-        return koji_session
+            prefix = "module-"
+            suffix = ""
+        nsvc_list = [name, stream, str(version), context]
+        nsvc_tag = prefix + "-".join(nsvc_list) + suffix
+        if len(nsvc_tag) + len("-build") > max_length:
+            # Fallback to the old format of 'module-<hash>' if the generated koji tag
+            # name is longer than max_length
+            nsvc_hash = hashlib.sha1(".".join(nsvc_list).encode("utf-8")).hexdigest()[:16]
+            return prefix + nsvc_hash + suffix
+        return nsvc_tag
 
     def buildroot_connect(self, groups):
         log.info("%r connecting buildroot." % self)
@@ -551,7 +449,7 @@ class KojiModuleBuilder(GenericBuilder):
             if "blocked_packages" in mbs_opts:
                 self._koji_block_packages(mbs_opts["blocked_packages"])
 
-        @module_build_service.utils.retry(wait_on=SysCallError, interval=5)
+        @retry(wait_on=SysCallError, interval=5)
         def add_groups():
             return self._koji_add_groups_to_tag(dest_tag=self.module_build_tag, groups=groups)
 
@@ -561,7 +459,7 @@ class KojiModuleBuilder(GenericBuilder):
         # checks the length with '-build' at the end, but we know we will never append '-build',
         # so we can safely have the name check be more characters
         target_length = 50 + len("-build")
-        target = module_build_service.utils.generate_koji_tag(
+        target = self.generate_koji_tag(
             self.module.name,
             self.module.stream,
             self.module.version,
@@ -682,7 +580,7 @@ class KojiModuleBuilder(GenericBuilder):
 
         timeout = 60 * 60  # 60 minutes
 
-        @module_build_service.utils.retry(timeout=timeout, wait_on=koji.GenericError)
+        @retry(timeout=timeout, wait_on=koji.GenericError)
         def get_result():
             log.debug("Waiting for task_id=%s to finish" % task_id)
             task = self.koji_session.getTaskResult(task_id)
@@ -699,6 +597,11 @@ class KojiModuleBuilder(GenericBuilder):
         :param component_build: a ComponentBuild object
         :return: a list of msgs that MBS needs to process
         """
+        # Imported here because of circular dependencies.
+        from module_build_service.scheduler.handlers.tags import tagged as tagged_handler
+        from module_build_service.scheduler.handlers.components import (
+            build_task_finalize as build_task_finalize_handler)
+
         opts = {"latest": True, "package": component_build.package, "inherit": False}
         build_tagged = self.koji_session.listTagged(self.module_build_tag["name"], **opts)
         dest_tagged = None
@@ -719,17 +622,17 @@ class KojiModuleBuilder(GenericBuilder):
             # If the build cannot be found in the tags, it may be untagged as a result
             # of some earlier inconsistent situation. Let's find the task_info
             # based on the list of untagged builds
-            release = module_build_service.utils.get_rpm_release(self.db_session, self.module)
+            release = get_rpm_release(self.db_session, self.module)
             untagged = self.koji_session.untaggedBuilds(name=component_build.package)
             for untagged_build in untagged:
                 if untagged_build["release"].endswith(release):
                     nvr = "{name}-{version}-{release}".format(**untagged_build)
                     build = self.koji_session.getBuild(nvr)
                     break
-        further_work = []
-        # If the build doesn't exist, then return
+
+        # If the build doesn't exist, then return False
         if not build:
-            return further_work
+            return False
 
         # Start setting up MBS' database to use the existing build
         log.info('Skipping build of "{0}" since it already exists.'.format(build["nvr"]))
@@ -740,19 +643,11 @@ class KojiModuleBuilder(GenericBuilder):
         component_build.state_reason = "Found existing build"
         nvr_dict = kobo.rpmlib.parse_nvr(component_build.nvr)
         # Trigger a completed build message
-        further_work.append(
-            module_build_service.messaging.KojiBuildChange(
-                "recover_orphaned_artifact: fake message",
-                build["build_id"],
-                build["task_id"],
-                koji.BUILD_STATES["COMPLETE"],
-                component_build.package,
-                nvr_dict["version"],
-                nvr_dict["release"],
-                component_build.module_build.id,
-            )
-        )
-
+        args = (
+            "recover_orphaned_artifact: fake message", build["task_id"],
+            koji.BUILD_STATES["COMPLETE"], component_build.package, nvr_dict["version"],
+            nvr_dict["release"], component_build.module_build.id, None)
+        events.scheduler.add(build_task_finalize_handler, args)
         component_tagged_in = []
         if build_tagged:
             component_tagged_in.append(self.module_build_tag["name"])
@@ -771,15 +666,10 @@ class KojiModuleBuilder(GenericBuilder):
                 'The build being skipped isn\'t tagged in the "{0}" tag. Will send a message to '
                 "the tag handler".format(tag)
             )
-            further_work.append(
-                module_build_service.messaging.KojiTagChange(
-                    "recover_orphaned_artifact: fake message",
-                    tag,
-                    component_build.package,
-                    component_build.nvr,
-                )
-            )
-        return further_work
+            args = ("recover_orphaned_artifact: fake message", tag, component_build.nvr)
+            events.scheduler.add(tagged_handler, args)
+
+        return True
 
     def build(self, artifact_name, source):
         """
@@ -868,7 +758,7 @@ class KojiModuleBuilder(GenericBuilder):
     @classmethod
     def repo_from_tag(cls, config, tag_name, arch):
         """
-        :param config: instance of module_build_service.config.Config
+        :param config: instance of module_build_service.common.config.Config
         :param tag_name: Tag for which the repository is returned
         :param arch: Architecture for which the repository is returned
 
@@ -877,7 +767,7 @@ class KojiModuleBuilder(GenericBuilder):
         """
         return "%s/%s/latest/%s" % (config.koji_repository_url, tag_name, arch)
 
-    @module_build_service.utils.validate_koji_tag("tag", post="")
+    @validate_koji_tag("tag", post="")
     def _get_tag(self, tag, strict=True):
         if isinstance(tag, dict):
             tag = tag["name"]
@@ -887,7 +777,7 @@ class KojiModuleBuilder(GenericBuilder):
                 raise SystemError("Unknown tag: %s" % tag)
         return taginfo
 
-    @module_build_service.utils.validate_koji_tag(["tag_name"], post="")
+    @validate_koji_tag(["tag_name"], post="")
     def _koji_add_many_tag_inheritance(self, tag_name, parent_tags):
         tag = self._get_tag(tag_name)
         # highest priority num is at the end
@@ -922,7 +812,7 @@ class KojiModuleBuilder(GenericBuilder):
         if inheritance_data:
             self.koji_session.setInheritanceData(tag["id"], inheritance_data)
 
-    @module_build_service.utils.validate_koji_tag("dest_tag")
+    @validate_koji_tag("dest_tag")
     def _koji_add_groups_to_tag(self, dest_tag, groups):
         """Add groups to a tag as well as packages listed by group
 
@@ -956,7 +846,7 @@ class KojiModuleBuilder(GenericBuilder):
             for pkg in packages:
                 self.koji_session.groupPackageListAdd(dest_tag, group, pkg)
 
-    @module_build_service.utils.validate_koji_tag("tag_name")
+    @validate_koji_tag("tag_name")
     def _koji_create_tag(self, tag_name, arches=None, perm=None):
         """Create a tag in Koji
 
@@ -1078,7 +968,7 @@ class KojiModuleBuilder(GenericBuilder):
         args = [[build_tag_name, package] for package in packages]
         koji_multicall_map(self.koji_session, self.koji_session.packageListUnblock, args)
 
-    @module_build_service.utils.validate_koji_tag(["build_tag", "dest_tag"])
+    @validate_koji_tag(["build_tag", "dest_tag"])
     def _koji_add_target(self, name, build_tag, dest_tag):
         """Add build target if it doesn't exist or validate the existing one
 
@@ -1176,7 +1066,7 @@ class KojiModuleBuilder(GenericBuilder):
         """
         # If the component has not been built before, then None is returned. Instead, let's
         # return 0.0 so the type is consistent
-        koji_session = KojiModuleBuilder.get_session(conf, login=False)
+        koji_session = get_session(conf, login=False)
         return koji_session.getAverageBuildDuration(component) or 0.0
 
     @classmethod
@@ -1191,8 +1081,7 @@ class KojiModuleBuilder(GenericBuilder):
         :rtype: dict
         :return: {component_name: weight_as_float, ...}
         """
-
-        koji_session = KojiModuleBuilder.get_session(conf)
+        koji_session = get_session(conf)
 
         # Get our own userID, so we can limit the builds to only modular builds
         user_info = koji_session.getLoggedInUser()
@@ -1287,7 +1176,7 @@ class KojiModuleBuilder(GenericBuilder):
             mmd.get_version(),
             mmd.get_context()
         )
-        koji_session = KojiModuleBuilder.get_session(conf, login=False)
+        koji_session = get_session(conf, login=False)
         rpms = koji_session.listTaggedRPMS(build.koji_tag, latest=True)[0]
         nvrs = set(kobo.rpmlib.make_nvr(rpm, force_epoch=True) for rpm in rpms)
         return list(nvrs)
@@ -1314,7 +1203,7 @@ class KojiModuleBuilder(GenericBuilder):
         :return: koji tag
         """
 
-        session = KojiModuleBuilder.get_session(conf, login=False)
+        session = get_session(conf, login=False)
         rpm_md = session.getRPM(rpm)
         if not rpm_md:
             return None
@@ -1340,7 +1229,7 @@ class KojiModuleBuilder(GenericBuilder):
         if not module.koji_tag:
             log.warning("No Koji tag associated with module %r", module)
             return []
-        koji_session = KojiModuleBuilder.get_session(conf, login=False)
+        koji_session = get_session(conf, login=False)
         tag = koji_session.getTag(module.koji_tag)
         if not tag:
             raise ValueError("Unknown Koji tag %r." % module.koji_tag)

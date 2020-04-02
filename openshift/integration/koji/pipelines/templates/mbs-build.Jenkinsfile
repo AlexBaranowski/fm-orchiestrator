@@ -137,7 +137,7 @@ pipeline {
             openshift.withProject(params.C3IAAS_REQUEST_PROJECT_BUILD_CONFIG_NAMESPACE) {
               c3i.buildAndWait(script: this, objs: "bc/${params.C3IAAS_REQUEST_PROJECT_BUILD_CONFIG_NAME}",
                 '-e', "PROJECT_NAME=${env.PIPELINE_ID}",
-                '-e', "ADMIN_GROUPS=system:serviceaccounts:${TRIGGER_NAMESPACE}",
+                '-e', "ADMIN_GROUPS=system:serviceaccounts:${TRIGGER_NAMESPACE},system:serviceaccounts:${PIPELINE_AS_A_SERVICE_BUILD_NAMESPACE}",
                 '-e', "LIFETIME_IN_MINUTES=${params.C3IAAS_LIFETIME}"
               )
             }

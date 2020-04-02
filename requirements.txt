@@ -19,3 +19,4 @@ pyOpenSSL
 requests
 six
 sqlalchemy
+celery

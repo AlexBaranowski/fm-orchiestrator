@@ -124,6 +124,8 @@ Options:
   ``scratch`` is ``True`` or if the MBS setting ``YAML_SUBMIT_ALLOWED`` is ``True``.
 - ``module_name`` - a string to use as the module name if a scratch build is requested and the
   YAML modulemd is submitted using the ``modulemd`` parameter.
+  - ``module_stream`` - a string to use as the stream name if a scratch build is requested and the
+  YAML modulemd is submitted using the ``modulemd`` parameter.
 - ``rebuild_strategy`` - a string of the desired rebuild strategy (affects what components get
   rebuilt). For the available options, please look at the "Rebuild Strategies" section below.
 - ``require_overrides`` - the requires to override the modulemd with. The overrides must be to
@@ -775,7 +777,7 @@ _`Module Build States`
 
 You can see the list of possible states with::
 
-    from module_build_service.models import BUILD_STATES
+    from module_build_service.common.models import BUILD_STATES
     print(BUILD_STATES)
 
 Here's a description of what each of them means:

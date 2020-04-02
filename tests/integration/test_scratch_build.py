@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 
-import utils
 
-
-def test_scratch_build(test_env, scenario, repo, koji):
+def test_scratch_build(pkg_util, scenario, repo, koji):
     """
     Run a scratch build with "rebuild_strategy=all".
 
@@ -14,14 +12,16 @@ def test_scratch_build(test_env, scenario, repo, koji):
       (as opposed to the "ready" state)
     * no content generator builds are created in Koji
     """
-    build = utils.Build(test_env["packaging_utility"], test_env["mbs_api"])
-    build.run(
+    builds = pkg_util.run(
         "--scratch",
         "--optional",
         "rebuild_strategy=all",
         reuse=scenario.get("build_id"),
     )
-    build.watch()
+
+    assert len(builds) == 1
+    pkg_util.watch(builds)
+    build = builds[0]
 
     assert build.state_name == "done"
     assert sorted(build.component_names(state="COMPLETE")) == sorted(

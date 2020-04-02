@@ -14,7 +14,7 @@ from alembic import op
 import sqlalchemy as sa
 
 # Data migration imports
-from module_build_service import Modulemd
+from module_build_service.common.modulemd import Modulemd
 import hashlib
 import json
 from collections import OrderedDict

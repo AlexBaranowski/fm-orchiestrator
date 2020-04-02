@@ -11,6 +11,7 @@ import yaml
 import requests
 import tempfile
 import sh
+import os
 
 our_sh = sh(_out=sys.stdout, _err=sys.stderr, _tee=True)
 from our_sh import Command, git, pushd  # noqa
@@ -52,6 +53,48 @@ class Koji:
         r = requests.get(f"{url}/modulemd.txt")
         r.raise_for_status()
         return yaml.safe_load(r.content)
+
+    def get_build_log(self, component, log_name):
+        """Log file related to a build.
+
+        :param dict component: Item produced with build.components()
+        :param str log_name: Filename of log e.g 'build.log'
+        :return Content of a log file
+        :rtype str
+        """
+        nvr = component['nvr']
+        build_logs = self._session.getBuildLogs(nvr)
+
+        for log in build_logs:
+            if log['name'] == log_name:
+                log_path = log['path']
+                break
+
+        url = self._topurl + '/' + log_path
+        r = requests.get(url)
+        r.raise_for_status()
+        return r.text
+
+    def get_macro_specfile(self, build):
+        """
+        Download macro src.rpm and extract spec file .
+
+        :param build: build object
+        :return: content of module-build-macros.spec
+        :rtype: str
+        """
+        parent_id = build.component_task_ids()['module-build-macros']
+        child_id = next(child['id'] for child in
+                        self._session.getTaskChildren(parent_id)
+                        if child['method'] == 'buildArch')
+        nvr = next(component['nvr'] for component in build.components()
+                   if component['package'] == 'module-build-macros')
+        file_name = nvr + ".src.rpm"
+        src_rpm = self._session.downloadTaskOutput(child_id, file_name)
+        with tempfile.NamedTemporaryFile() as temp_file:
+            temp_file.write(src_rpm)
+            return os.popen(f"rpm2cpio {temp_file.name} | "
+                            f"cpio -ci --to-stdout '*.spec'").read()
 
 
 class Repo:
@@ -114,69 +157,90 @@ class Repo:
         git("push")
 
 
-class Build:
-    """Wrapper class to work with module builds
+class PackagingUtility:
+    """Wrapper class to work with the packaging utility configured for the tests
 
     :attribute sh.Command _packaging_utility: packaging utility command used to
         kick off this build
     :attribute string _mbs_api: URL of the MBS API (including trailing '/')
-    :attribute string _url: URL of this MBS module build
-    :attribute string _data: Module build data cache for this build fetched from MBS
-    :attribute string _module_build_data: Verbose module build data cache for this build
     """
 
     def __init__(self, packaging_utility, mbs_api):
         self._packaging_utility = Command(packaging_utility).bake(
-            _out=sys.stdout, _err=sys.stderr, _tee=True
+            _out=sys.stdout,
+            _err=sys.stderr,
+            _tee=True
         )
         self._mbs_api = mbs_api
-        self._data = None
-        self._component_data = None
-        self._build_id = None
-        self._module_build_data = None
 
-    def run(self, *args, reuse=None):
-        """Run a module build
+    def run(self, *args, reuse=None, **kwargs):
+        """Run one or more module builds
 
         :param args: Options and arguments for the build command
-        :param int reuse: Optional MBS build id to be reused for this run.
-            When specified, the corresponding module build will be used,
-            instead of triggering and waiting for a new one to finish.
+        :param int reuse: An optional MBS build id or a list of MBS build
+            ids to be reused for this run.
+            When specified, the corresponding module build(s) will be used,
+            instead of triggering and waiting for new one(s) to finish.
             Intended to be used while developing the tests.
-        :return: MBS build id of the build created
-        :rtype: int
+        :return: list of Build objects for the MBS builds created
+        :rtype: list of Build objects
         """
-        current_build_id = self._build_id
+        build_ids = []
+
         if reuse is not None:
-            self._build_id = int(reuse)
+            if isinstance(reuse, list):
+                build_ids = reuse
+            else:
+                build_ids = [reuse]
         else:
-            stdout = self._packaging_utility("module-build", *args).stdout.decode("utf-8")
-            self._build_id = int(re.search(self._mbs_api + r"module-builds/(\d+)", stdout).group(1))
-        # Clear cached data
-        if current_build_id != self._build_id:
-            self._component_data = None
-        return self._build_id
+            stdout = self._packaging_utility("module-build", *args, **kwargs).stdout.decode("utf-8")
+            build_ids = re.findall(self._mbs_api + r"module-builds/(\d+)", stdout)
+        return [Build(self._mbs_api, int(build_id)) for build_id in build_ids]
 
-    def watch(self):
-        """Watch the build till the finish"""
-        if self._build_id is None:
-            raise RuntimeError("Build was not started. Cannot watch.")
+    def watch(self, builds):
+        """Watch one or more builds till the finish
 
+        :param list builds: list of Build objects of the builds to be watched.
+        :return: Stdout of the watch command
+        :rtype: string
+        """
         stdout = self._packaging_utility(
-            "module-build-watch", str(self._build_id)
+            "module-build-watch", [str(build.id) for build in builds]
         ).stdout.decode("utf-8")
 
         return stdout
 
-    def cancel(self):
+    def cancel(self, build):
         """Cancel the module build
 
+        :param list build: the Build object of the module build to be cancelled.
         :return: Standard output of the "module-build-cancel <build id=""> command
         :rtype: str
         """
-        stdout = self._packaging_utility("module-build-cancel", self._build_id).stdout.decode(
+        stdout = self._packaging_utility("module-build-cancel", build.id).stdout.decode(
             "utf-8")
         return stdout
+
+
+class Build:
+    """Wrapper class to work with module builds
+
+    :attribute string _mbs_api: URL of the MBS API (including trailing '/')
+    :attribute int _build_id: id of this MBS module build
+    :attribute string _data: Module build data cache for this build fetched from MBS
+    :attribute string _module_build_data: Verbose module build data cache for this build
+    """
+
+    def __init__(self, mbs_api, build_id):
+        self._mbs_api = mbs_api
+        self._data = None
+        self._component_data = None
+        self._build_id = build_id
+        self._module_build_data = None
+
+    @property
+    def id(self):
+        return self._build_id
 
     @property
     def data(self):
@@ -370,3 +434,30 @@ class Component:
         with pushd(self._clone_dir.name):
             git("commit", *args)
             git("push")
+
+
+class MBS:
+    """Wrapper class to work with MBS requests.
+
+    :attribute string _mbs_api: URL of the MBS API (including trailing '/')
+    """
+
+    def __init__(self, mbs_api):
+        self._mbs_api = mbs_api
+
+    def get_builds(self, module, stream, order_desc_by=None):
+        """Get list of Builds objects via mbs api.
+
+        :attribute string module: Module name
+        :attribute string stream: Stream name
+        :attribute string order_desc_by: Optional sorting parameter e.g. "version"
+        :return: list of Build objects
+        :rtype: list
+        """
+        url = f"{self._mbs_api}module-builds/"
+        payload = {'name': module, "stream": stream}
+        if order_desc_by:
+            payload.update({"order_desc_by": order_desc_by})
+        r = requests.get(url, params=payload)
+        r.raise_for_status()
+        return [Build(self._mbs_api, build["id"]) for build in r.json()["items"]]

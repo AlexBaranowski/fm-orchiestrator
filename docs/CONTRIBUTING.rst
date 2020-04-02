@@ -20,7 +20,7 @@ section "Updating test images in Quay" to learn how to manage these images.
 
 .. _factory2: https://quay.io/organization/factory2
 
-To run the tests, just simply run: ``contrib/run-unittests.sh``
+To run the tests, just simply run: ``run-unittests.sh``
 
 By default, this script runs tests inside container ``mbs-test-centos``
 with Python 2 and SQLite database.
@@ -34,13 +34,13 @@ There are options to change the tests enviornment:
 * ``--podman``: use Podman instead of Docker
 * ``--no-pull``: don't update Docker images
 
-For example, ``contrib/run-unittests.sh --py3 --with-pgsql``.
+For example, ``run-unittests.sh --py3 --with-pgsql``.
 
 You can specify the subset of tests to run inside the container as well. Tests
 specified from the command-line are passed to ``py.test`` directly. Please note that,
 the path of each test must be a relative path. For example::
 
-    contrib/run-unittests.sh \
+    run-unittests.sh \
         tests/test_utils/ \
         tests/test_mmd_resolver.py \
         tests/test_builder/test_koji.py::TestKojiBuilder::test_tag_to_repo
@@ -91,18 +91,21 @@ Also, the format of the docstrings should be in the
     :raises TypeError: if a or b are not integers
 
 
-Additionally, the imports should be ordered by standard library, third-party, then local. For example:
+Additionally, the imports should be ordered by standard library, third-party, then local.
+``from __future__ import absolute_import`` should always be included so that imports are consistent
+in Python 2 and Python 3. For example:
 
 ::
 
+    from __future__ import absolute_import
     import math
     import os
 
     import flask
     import requests
 
-    import module_build_service.utils
-    from module_build_service.errors import ValidationError
+    import module_build_service.web
+    from module_build_service.common.errors import ValidationError
 
 
 Lastly, hanging indentation should be avoided when possible. For example:
@@ -185,8 +188,9 @@ Logging
 -------
 
 If you're running module_build_service from scm, then the DevConfiguration
-from ``conf/config.py`` which contains ``LOG_LEVEL=debug`` should get applied. See
-more about it in ``module_build_service/config.py``, ``app.config.from_object()``.
+from ``module_build_service/common/config.py`` which contains ``LOG_LEVEL=debug`` should get
+applied. See more about it in ``module_build_service/common/config.py``,
+``app.config.from_object()``.
 
 Environment
 -----------

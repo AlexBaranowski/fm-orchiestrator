@@ -14,8 +14,8 @@ data:
       mksh: {cache: 'http://pkgs.fedoraproject.org/repo/pkgs/mksh', rationale: A build
           dependency of mksh., ref: master, repository: 'https://src.fedoraproject.org/rpms/mksh'}
   dependencies:
-    buildrequires: {platform: f28, testmodule: master}
-    requires: {platform: f28}
+    buildrequires: {platform: f30, testmodule: master}
+    requires: {platform: f30}
   description: This module demonstrates how to write simple modulemd files And can
     be used for testing the build and release pipeline.
   license:
@@ -31,7 +31,7 @@ data:
   xmd:
     mbs:
       buildrequires:
-        platform: {ref: virtual, stream: f28, version: '3'}
+        platform: {ref: virtual, stream: f30, version: '3'}
         testmodule: {stream: master, version: '20170816080815'}
       commit: null
       rpms:

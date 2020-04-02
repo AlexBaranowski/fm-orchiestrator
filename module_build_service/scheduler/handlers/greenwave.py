@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
-from module_build_service import conf, log
-from module_build_service.builder.KojiModuleBuilder import KojiModuleBuilder
-from module_build_service.db_session import db_session
-from module_build_service.models import ModuleBuild, BUILD_STATES
+from __future__ import absolute_import
+
+from module_build_service.common import conf, log
+from module_build_service.common.koji import get_session
+from module_build_service.common.models import ModuleBuild, BUILD_STATES
+from module_build_service.scheduler.db_session import db_session
+from module_build_service.scheduler import celery_app, events
 
 
 def get_corresponding_module_build(nvr):
@@ -16,7 +19,7 @@ def get_corresponding_module_build(nvr):
         ``nvr``, None will be returned.
     :rtype: :class:`ModuleBuild` or None
     """
-    koji_session = KojiModuleBuilder.get_session(conf, login=False)
+    koji_session = get_session(conf, login=False)
     build_info = koji_session.getBuild(nvr)
     if build_info is None:
         return None
@@ -31,36 +34,40 @@ def get_corresponding_module_build(nvr):
     return ModuleBuild.get_by_id(db_session, module_build_id)
 
 
-def decision_update(config, msg):
+@celery_app.task
+@events.mbs_event_handler
+def decision_update(msg_id, decision_context, subject_identifier, policies_satisfied):
     """Move module build to ready or failed according to Greenwave result
 
-    :param config: the config object returned from function :func:`init_config`,
-        which is loaded from configuration file.
-    :type config: :class:`Config`
-    :param msg: the message object representing a message received from topic
-        ``greenwave.decision.update``.
-    :type msg: :class:`GreenwaveDecisionUpdate`
+    :param str msg_id: the original id of the message being handled which is
+        received from the message bus.
+    :param str decision_context: the context of the greewave decision. Refer to
+        the messaging document for detailed information.
+    :param str subject_identifier: usually a build NVR. Refer to
+        https://docs.pagure.org/greenwave/messaging.html for detailed information.
+    :param bool policies_satisfied: whether the build satisfies Greenwave rules.
+        Refer to the messaging document for detailed information.
     """
-    if not config.greenwave_decision_context:
+    if not conf.greenwave_decision_context:
         log.debug(
             "Skip Greenwave message %s as MBS does not have GREENWAVE_DECISION_CONTEXT "
             "configured",
-            msg.msg_id,
+            msg_id,
         )
         return
 
-    if msg.decision_context != config.greenwave_decision_context:
+    if decision_context != conf.greenwave_decision_context:
         log.debug(
             "Skip Greenwave message %s as MBS only handles messages with the "
             'decision context "%s"',
-            msg.msg_id,
-            config.greenwave_decision_context,
+            msg_id,
+            conf.greenwave_decision_context,
         )
         return
 
-    module_build_nvr = msg.subject_identifier
+    module_build_nvr = subject_identifier
 
-    if not msg.policies_satisfied:
+    if not policies_satisfied:
         log.debug(
             "Skip to handle module build %s because it has not satisfied Greenwave policies.",
             module_build_nvr,
@@ -87,8 +94,7 @@ def decision_update(config, msg):
         log.warning(
             "Module build %s is not in done state but Greenwave tells "
             "it passes tests in decision context %s",
-            module_build_nvr,
-            msg.decision_context,
+            module_build_nvr, decision_context,
         )
 
     db_session.commit()

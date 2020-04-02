@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
-import koji
+from __future__ import absolute_import
+from datetime import datetime
 import os
+
+import koji
+import mock
 import pytest
 
-from datetime import datetime
-
 import module_build_service
-
-from module_build_service.models import BUILD_STATES
-from module_build_service.db_session import db_session
-from module_build_service.utils.general import mmd_to_str, load_mmd, get_rpm_release
+from module_build_service.builder.utils import get_rpm_release
+from module_build_service.common.models import BUILD_STATES
+from module_build_service.common.utils import load_mmd, mmd_to_str
+from module_build_service.scheduler.db_session import db_session
 from tests import clean_database, read_staged_data, module_build_from_modulemd
 
 BASE_DIR = os.path.dirname(__file__)
@@ -60,7 +62,9 @@ def model_tests_init_data():
     """
     clean_database()
 
-    model_test_data_dir = os.path.join(os.path.dirname(__file__), "test_models", "data")
+    model_test_data_dir = os.path.join(
+        os.path.dirname(__file__), "test_common", "test_models", "data"
+    )
 
     for filename in os.listdir(model_test_data_dir):
         with open(os.path.join(model_test_data_dir, filename), "r") as f:
@@ -77,7 +81,7 @@ def reuse_component_init_data():
 
     mmd = load_mmd(read_staged_data("formatted_testmodule"))
 
-    build_one = module_build_service.models.ModuleBuild(
+    build_one = module_build_service.common.models.ModuleBuild(
         name="testmodule",
         stream="master",
         version='20170109091357',
@@ -103,7 +107,7 @@ def reuse_component_init_data():
     xmd["mbs"]["commit"] = "ff1ea79fc952143efeed1851aa0aa006559239ba"
     mmd.set_xmd(xmd)
     build_one.modulemd = mmd_to_str(mmd)
-    contexts = module_build_service.models.ModuleBuild.contexts_from_mmd(build_one.modulemd)
+    contexts = module_build_service.common.models.ModuleBuild.contexts_from_mmd(build_one.modulemd)
     build_one.build_context = contexts.build_context
     build_one.build_context_no_bms = contexts.build_context_no_bms
 
@@ -111,14 +115,14 @@ def reuse_component_init_data():
     db_session.commit()
     db_session.refresh(build_one)
 
-    platform_br = module_build_service.models.ModuleBuild.get_by_id(db_session, 1)
+    platform_br = module_build_service.common.models.ModuleBuild.get_by_id(db_session, 1)
     build_one.buildrequires.append(platform_br)
 
-    arch = db_session.query(module_build_service.models.ModuleArch).get(1)
+    arch = db_session.query(module_build_service.common.models.ModuleArch).get(1)
     build_one.arches.append(arch)
 
     db_session.add_all([
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=build_one.id,
             package="perl-Tangerine",
             scmurl="https://src.fedoraproject.org/rpms/perl-Tangerine"
@@ -132,7 +136,7 @@ def reuse_component_init_data():
             tagged=True,
             tagged_in_final=True,
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=build_one.id,
             package="perl-List-Compare",
             scmurl="https://src.fedoraproject.org/rpms/perl-List-Compare"
@@ -146,7 +150,7 @@ def reuse_component_init_data():
             tagged=True,
             tagged_in_final=True,
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=build_one.id,
             package="tangerine",
             scmurl="https://src.fedoraproject.org/rpms/tangerine"
@@ -160,7 +164,7 @@ def reuse_component_init_data():
             tagged=True,
             tagged_in_final=True,
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=build_one.id,
             package="module-build-macros",
             scmurl="/tmp/module_build_service-build-macrosqr4AWH/SRPMS/module-build-"
@@ -177,7 +181,7 @@ def reuse_component_init_data():
     # Commit component builds added to build_one
     db_session.commit()
 
-    build_two = module_build_service.models.ModuleBuild(
+    build_two = module_build_service.common.models.ModuleBuild(
         name="testmodule",
         stream="master",
         version='20170219191323',
@@ -202,7 +206,7 @@ def reuse_component_init_data():
     xmd["mbs"]["commit"] = "55f4a0a2e6cc255c88712a905157ab39315b8fd8"
     mmd.set_xmd(xmd)
     build_two.modulemd = mmd_to_str(mmd)
-    contexts = module_build_service.models.ModuleBuild.contexts_from_mmd(build_two.modulemd)
+    contexts = module_build_service.common.models.ModuleBuild.contexts_from_mmd(build_two.modulemd)
     build_two.build_context = contexts.build_context
     build_two.build_context_no_bms = contexts.build_context_no_bms
 
@@ -214,7 +218,7 @@ def reuse_component_init_data():
     build_two.buildrequires.append(platform_br)
 
     db_session.add_all([
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=build_two.id,
             package="perl-Tangerine",
             scmurl="https://src.fedoraproject.org/rpms/perl-Tangerine"
@@ -223,7 +227,7 @@ def reuse_component_init_data():
             batch=2,
             ref="4ceea43add2366d8b8c5a622a2fb563b625b9abf",
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=build_two.id,
             package="perl-List-Compare",
             scmurl="https://src.fedoraproject.org/rpms/perl-List-Compare"
@@ -232,7 +236,7 @@ def reuse_component_init_data():
             batch=2,
             ref="76f9d8c8e87eed0aab91034b01d3d5ff6bd5b4cb",
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=build_two.id,
             package="tangerine",
             scmurl="https://src.fedoraproject.org/rpms/tangerine"
@@ -241,7 +245,7 @@ def reuse_component_init_data():
             batch=3,
             ref="fbed359411a1baa08d4a88e0d12d426fbf8f602c",
         ),
-        module_build_service.models.ComponentBuild(
+        module_build_service.common.models.ComponentBuild(
             module_id=build_two.id,
             package="module-build-macros",
             scmurl="/tmp/module_build_service-build-macrosqr4AWH/SRPMS/module-build-"
@@ -269,11 +273,11 @@ def reuse_shared_userspace_init_data():
     xmd["mbs"]["commit"] = "55f4a0a2e6cc255c88712a905157ab39315b8fd8"
     mmd.set_xmd(xmd)
 
-    module_build = module_build_service.models.ModuleBuild(
+    module_build = module_build_service.common.models.ModuleBuild(
         name=mmd.get_module_name(),
         stream=mmd.get_stream_name(),
         version=mmd.get_version(),
-        build_context=module_build_service.models.ModuleBuild.calculate_build_context(
+        build_context=module_build_service.common.models.ModuleBuild.calculate_build_context(
             xmd["mbs"]["buildrequires"]
         ),
         runtime_context="50dd3eb5dde600d072e45d4120e1548ce66bc94a",
@@ -307,7 +311,7 @@ def reuse_shared_userspace_init_data():
         full_url = pkg.get_repository() + "?#" + pkgref
 
         module_build.component_builds.append(
-            module_build_service.models.ComponentBuild(
+            module_build_service.common.models.ComponentBuild(
                 package=pkg.get_name(),
                 format="rpms",
                 scmurl=full_url,
@@ -330,11 +334,11 @@ def reuse_shared_userspace_init_data():
     xmd["mbs"]["commit"] = "55f4a0a2e6cc255c88712a905157ab39315b8fd8"
     mmd2.set_xmd(xmd)
 
-    module_build = module_build_service.models.ModuleBuild(
+    module_build = module_build_service.common.models.ModuleBuild(
         name=mmd2.get_module_name(),
         stream=mmd2.get_stream_name(),
         version=mmd2.get_version(),
-        build_context=module_build_service.models.ModuleBuild.calculate_build_context(
+        build_context=module_build_service.common.models.ModuleBuild.calculate_build_context(
             xmd["mbs"]["buildrequires"]
         ),
         runtime_context="50dd3eb5dde600d072e45d4120e1548ce66bc94a",
@@ -371,9 +375,25 @@ def reuse_shared_userspace_init_data():
         full_url = pkg.get_repository() + "?#" + pkgref
 
         module_build.component_builds.append(
-            module_build_service.models.ComponentBuild(
+            module_build_service.common.models.ComponentBuild(
                 package=pkg.get_name(), format="rpms", scmurl=full_url, batch=batch, ref=pkgref)
         )
 
     db_session.add(module_build)
     db_session.commit()
+
+
+@pytest.fixture(autouse=True)
+def cleanup_build_logs(request):
+    """
+    Clean up any build logs remaining after each test so that it doesn't affect tests run later.
+    """
+
+    def _cleanup_build_logs():
+        build_ids = list(module_build_service.common.build_logs.handlers.keys())
+        for build_id in build_ids:
+            mock_build = mock.Mock()
+            mock_build.id = build_id
+            module_build_service.common.build_logs.stop(mock_build)
+
+    request.addfinalizer(_cleanup_build_logs)

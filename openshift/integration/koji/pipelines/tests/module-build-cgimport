@@ -1,0 +1,81 @@
+#!/bin/bash -ex
+
+# expected environment variables:
+# CACERT = filepath with CA cert
+# MBS_FRONTEND_HOST
+# KOJI_CONFIG = path to koji configuration
+
+# Kerberos ticket with user having permissions to build module
+
+if [ -z "$CACERT" ] || [ -z "$MBS_FRONTEND_HOST" ] || [ -z "$KOJI_CONFIG" ] || ! klist &>/dev/null ; then
+    echo "Missing environment configuration"
+    exit 1
+fi
+
+RESPONSE=$(mktemp)
+HTTP_CODE=$(mktemp)
+SCMURL="https://src.fedoraproject.org/forks/mikeb/modules/testmodule.git?#8b3fb16160f899ce10905faf570f110d52b91154"
+EXISTING_MODULE=$(curl -s --cacert $CACERT https://${MBS_FRONTEND_HOST}/module-build-service/1/module-builds/ | jq ".items[] | select(.scmurl == \"${SCMURL}\" and .state != 4) | .id")
+if [ -n "$EXISTING_MODULE" ]; then
+    echo "Marking existing module $EXISTING_MODULE as failed so it can be rebuilt..."
+    curl -s --negotiate -u : \
+         --cacert $CACERT \
+         -X PATCH \
+         -d '{"state": "failed"}' \
+         https://${MBS_FRONTEND_HOST}/module-build-service/1/module-builds/${EXISTING_MODULE} | jq
+fi
+curl -s --negotiate -u : \
+     --cacert $CACERT \
+     -H 'Content-Type: application/json' \
+     -H 'Accept: application/json' \
+     -d "{\"scmurl\": \"${SCMURL}\", \"branch\": \"empty-f28\"}" \
+     -o $RESPONSE \
+     -w '%{stderr}%{http_code}' \
+     https://${MBS_FRONTEND_HOST}/module-build-service/1/module-builds/ 2> $HTTP_CODE
+if [ "$(cat $HTTP_CODE)" != "201" ]; then
+    echo "HTTP code was $(cat $HTTP_CODE), not 201"
+    exit 1
+fi
+MODULE_ID=$(jq '.id' $RESPONSE)
+i=0
+while true; do
+    sleep 5
+    i=$((i + 1))
+    if [ $i -gt 100 ]; then
+        echo "Module build has timed out"
+        exit 1
+    fi
+    curl -s --cacert $CACERT \
+         -o $RESPONSE \
+         -w '%{stderr}%{http_code}' \
+         https://${MBS_FRONTEND_HOST}/module-build-service/1/module-builds/$MODULE_ID 2> $HTTP_CODE
+    if [ "$(cat $HTTP_CODE)" != "200" ]; then
+        echo "HTTP code was $(cat $HTTP_CODE), not 200"
+        exit 1
+    fi
+    STATE=$(jq -r '.state_name' $RESPONSE)
+    if [ "$STATE" == "failed" ]; then
+        echo "Module build failed"
+        exit 1
+    elif [ "$STATE" == "ready" ]; then
+        echo "Module build is ready"
+    else
+        continue
+    fi
+    TESTMODULE="$(koji -c $KOJI_CONFIG -q list-builds --package testmodule)"
+    if [ -z "$TESTMODULE" ]; then
+        echo "No builds of testmodule"
+        exit 1
+    else
+        echo $TESTMODULE
+    fi
+    TESTMODULEDEVEL="$(koji -c $KOJI_CONFIG -q list-builds --package testmodule-devel)"
+    if [ -z "$TESTMODULEDEVEL" ]; then
+        echo "No builds of testmodule-devel"
+        exit 1
+    else
+        echo $TESTMODULEDEVEL
+    fi
+    echo "All tests passed"
+    break
+done

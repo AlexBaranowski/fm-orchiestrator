@@ -2,22 +2,17 @@
 # SPDX-License-Identifier: MIT
 """Generic component build functions."""
 
-# TODO: Query the MBS to find what modules satisfy the build dependencies and
-#       their tag names.
-# TODO: Ensure the RPM %dist tag is set according to the policy.
-
-import six
-import dogpile.cache
+from __future__ import absolute_import
 from abc import ABCMeta, abstractmethod
-from requests.exceptions import ConnectionError
 
-from module_build_service import conf, log
-import module_build_service.resolver
-import module_build_service.scm
-import module_build_service.utils
-from module_build_service.models import BUILD_STATES
+import dogpile.cache
+from requests.exceptions import ConnectionError
+import six
+
+from module_build_service.common import conf, log, models
+from module_build_service.common.models import BUILD_STATES
+from module_build_service.common.retry import retry
 from module_build_service.resolver import GenericResolver
-from module_build_service.utils import create_dogpile_key_generator_func
 
 
 """
@@ -36,12 +31,43 @@ Koji workflow
 """
 
 
+def create_dogpile_key_generator_func(skip_first_n_args=0):
+    """
+    Creates dogpile key_generator function with additional features:
+
+    - when models.ModuleBuild is an argument of method cached by dogpile-cache,
+      the ModuleBuild.id is used as a key. Therefore it is possible to cache
+      data per particular module build, while normally, it would be per
+      ModuleBuild.__str__() output, which contains also batch and other data
+      which changes during the build of a module.
+    - it is able to skip first N arguments of a cached method. This is useful
+      when the db.session is part of cached method call, and the caching should
+      work no matter what session instance is passed to cached method argument.
+    """
+
+    def key_generator(namespace, fn):
+        fname = fn.__name__
+
+        def generate_key(*arg, **kwarg):
+            key_template = fname + "_"
+            for s in arg[skip_first_n_args:]:
+                if type(s) == models.ModuleBuild:
+                    key_template += str(s.id)
+                else:
+                    key_template += str(s) + "_"
+            return key_template
+
+        return generate_key
+
+    return key_generator
+
+
 class GenericBuilder(six.with_metaclass(ABCMeta)):
     """
     External Api for builders
 
     Example usage:
-        config = module_build_service.config.Config()
+        config = module_build_service.common.config.Config()
         builder = Builder(module="testmodule-1.2-3", backend="koji", config)
         builder.buildroot_connect()
         builder.build(artifact_name="bash",
@@ -84,9 +110,9 @@ class GenericBuilder(six.with_metaclass(ABCMeta)):
         """
         :param db_session: SQLAlchemy session object.
         :param owner: a string representing who kicked off the builds
-        :param module: module_build_service.models.ModuleBuild instance.
+        :param module: module_build_service.common.models.ModuleBuild instance.
         :param backend: a string representing backend e.g. 'koji'
-        :param config: instance of module_build_service.config.Config
+        :param config: instance of module_build_service.common.config.Config
 
         Any additional arguments are optional extras which can be passed along
         and are implementation-dependent.
@@ -112,8 +138,8 @@ class GenericBuilder(six.with_metaclass(ABCMeta)):
         and config and connects it to buildroot.
 
         :param db_session: SQLAlchemy database session.
-        :param module: module_build_service.models.ModuleBuild instance.
-        :param config: module_build_service.config.Config instance.
+        :param module: module_build_service.common.models.ModuleBuild instance.
+        :param config: module_build_service.common.config.Config instance.
         :kwarg buildroot_connect: a boolean that determines if the builder should run
         buildroot_connect on instantiation.
         """
@@ -136,7 +162,7 @@ class GenericBuilder(six.with_metaclass(ABCMeta)):
     def tag_to_repo(cls, backend, config, tag_name, arch):
         """
         :param backend: a string representing the backend e.g. 'koji'.
-        :param config: instance of module_build_service.config.Config
+        :param config: instance of module_build_service.common.config.Config
         :param tag_name: Tag for which the repository is returned
         :param arch: Architecture for which the repository is returned
 
@@ -267,7 +293,7 @@ class GenericBuilder(six.with_metaclass(ABCMeta)):
     @abstractmethod
     def repo_from_tag(self, config, tag_name, arch):
         """
-        :param config: instance of module_build_service.config.Config
+        :param config: instance of module_build_service.common.config.Config
         :param tag_name: Tag for which the repository is returned
         :param arch: Architecture for which the repository is returned
 
@@ -285,7 +311,7 @@ class GenericBuilder(six.with_metaclass(ABCMeta)):
             "default_buildroot_groups_" + str(module_build.id))
 
     @classmethod
-    @module_build_service.utils.retry(wait_on=(ConnectionError))
+    @retry(wait_on=(ConnectionError))
     @default_buildroot_groups_cache.cache_on_arguments()
     def default_buildroot_groups(cls, db_session, module):
         try:

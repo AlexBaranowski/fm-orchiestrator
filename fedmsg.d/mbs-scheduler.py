@@ -1,1 +1,1 @@
-config = {"mbsconsumer": True, "mbspoller": True}
+config = {"mbsconsumer": True}

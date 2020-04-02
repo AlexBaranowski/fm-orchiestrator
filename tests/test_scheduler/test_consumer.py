@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
+
 from mock import patch, MagicMock
+import pytest
+
+from module_build_service.common.errors import IgnoreMessage
+from module_build_service.scheduler import events
 from module_build_service.scheduler.consumer import MBSConsumer
-from module_build_service.messaging import KojiTagChange, KojiRepoChange
 
 
 class TestConsumer:
@@ -35,11 +40,10 @@ class TestConsumer:
                 "release": "1.el7",
             },
         }
-        msg_obj = consumer.get_abstracted_msg(msg)
-        assert isinstance(msg_obj, KojiTagChange)
-        assert msg_obj.msg_id == msg["msg_id"]
-        assert msg_obj.tag == msg["msg"]["tag"]
-        assert msg_obj.artifact == msg["msg"]["name"]
+        event_info = consumer.get_abstracted_event_info(msg)
+        assert event_info["event"] == events.KOJI_TAG_CHANGE
+        assert event_info["msg_id"] == msg["msg_id"]
+        assert event_info["tag_name"] == msg["msg"]["tag"]
 
     @patch("module_build_service.scheduler.consumer.models")
     @patch.object(MBSConsumer, "process_message")
@@ -73,7 +77,36 @@ class TestConsumer:
         }
         consumer.consume(msg)
         assert process_message.call_count == 1
-        msg_obj = process_message.call_args[0][0]
-        assert isinstance(msg_obj, KojiRepoChange)
-        assert msg_obj.msg_id == msg["body"]["msg_id"]
-        assert msg_obj.repo_tag == msg["body"]["msg"]["tag"]
+        event_info = process_message.call_args[0][0]
+        assert event_info["event"] == events.KOJI_REPO_CHANGE
+        assert event_info["msg_id"] == msg["body"]["msg_id"]
+        assert event_info["tag_name"] == msg["body"]["msg"]["tag"]
+
+    @patch.object(MBSConsumer, "process_message")
+    def test_ingore_koji_build_change_event_without_task_id(self, process_message):
+        """
+        Test koji_build_change event without task_id should be ignored.
+        """
+        hub = MagicMock(config={})
+        consumer = MBSConsumer(hub)
+        event = {
+            'build_new_state': 1,
+            'task_id': None,
+            'msg_id': u'f66a43be-e510-44fc-a318-e422cfda65d3',
+            'module_build_id': None,
+            'state_reason': None,
+            'build_name': 'foobar',
+            'build_version': '201912130626',
+            'event': 'koji_build_change',
+            'build_release': u'070752'
+        }
+        consumer.get_abstracted_event_info = MagicMock()
+        consumer.get_abstracted_event_info.return_value = event
+        consumer.consume({})
+        assert process_message.call_count == 0
+
+    def test_validate_event_none_msg(self):
+        hub = MagicMock(config={})
+        consumer = MBSConsumer(hub)
+        with pytest.raises(IgnoreMessage):
+            consumer.validate_event(None)

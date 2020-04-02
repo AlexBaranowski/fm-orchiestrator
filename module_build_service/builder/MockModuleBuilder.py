@@ -1,33 +1,33 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
+from __future__ import absolute_import
 import logging
 import os
-import koji
-import kobo.rpmlib
 import pipes
-import platform
 import re
 import subprocess
 import threading
 
-from module_build_service import conf, log
-import module_build_service.scm
-import module_build_service.utils
-import module_build_service.scheduler
-import module_build_service.scheduler.consumer
+import dnf
+import koji
+import kobo.rpmlib
+import platform
 
-from module_build_service.builder.base import GenericBuilder
+from module_build_service.builder import GenericBuilder
+from module_build_service.builder.KojiModuleBuilder import KojiModuleBuilder
 from module_build_service.builder.utils import (
     create_local_repo_from_koji_tag,
     execute_cmd,
     find_srpm,
     get_koji_config,
+    validate_koji_tag,
 )
-from module_build_service.utils.general import mmd_to_str
-from module_build_service.db_session import db_session
-from module_build_service.builder.KojiModuleBuilder import KojiModuleBuilder
-
-from module_build_service import models
+from module_build_service.common import conf, log, models
+from module_build_service.common.koji import get_session
+from module_build_service.common.modulemd import Modulemd
+from module_build_service.common.utils import import_mmd, load_mmd_file, mmd_to_str
+from module_build_service.scheduler import events
+from module_build_service.scheduler.db_session import db_session
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -44,6 +44,201 @@ def detect_arch():
         log.warning("Couldn't determine machine arch. Falling back to configured arch.")
 
     return conf.arch_fallback
+
+
+def import_fake_base_module(nsvc):
+    """
+    Creates and imports new fake base module to be used with offline local builds.
+
+    :param str nsvc: name:stream:version:context of a module.
+    """
+    name, stream, version, context = nsvc.split(":")
+    mmd = Modulemd.ModuleStreamV2.new(name, stream)
+    mmd.set_version(int(version))
+    mmd.set_context(context)
+    mmd.set_summary("fake base module")
+    mmd.set_description("fake base module")
+    mmd.add_module_license("GPL")
+
+    buildroot = Modulemd.Profile.new("buildroot")
+    for rpm in conf.default_buildroot_packages:
+        buildroot.add_rpm(rpm)
+    mmd.add_profile(buildroot)
+
+    srpm_buildroot = Modulemd.Profile.new("srpm-buildroot")
+    for rpm in conf.default_srpm_buildroot_packages:
+        srpm_buildroot.add_rpm(rpm)
+    mmd.add_profile(srpm_buildroot)
+
+    xmd = {"mbs": {}}
+    xmd_mbs = xmd["mbs"]
+    xmd_mbs["buildrequires"] = {}
+    xmd_mbs["requires"] = {}
+    xmd_mbs["commit"] = "ref_%s" % context
+    xmd_mbs["mse"] = "true"
+    # Use empty "repofile://" URI for base module. The base module will use the
+    # `conf.base_module_names` list as list of default repositories.
+    xmd_mbs["koji_tag"] = "repofile://"
+    mmd.set_xmd(xmd)
+
+    import_mmd(db_session, mmd, False)
+
+
+def load_local_builds(local_build_nsvs):
+    """
+    Loads previously finished local module builds from conf.mock_resultsdir
+    and imports them to database.
+
+    :param local_build_nsvs: List of NSV separated by ':' defining the modules
+        to load from the mock_resultsdir.
+    """
+    if not local_build_nsvs:
+        return
+
+    if type(local_build_nsvs) != list:
+        local_build_nsvs = [local_build_nsvs]
+
+    # Get the list of all available local module builds.
+    builds = []
+    try:
+        for d in os.listdir(conf.mock_resultsdir):
+            m = re.match("^module-(.*)-([^-]*)-([0-9]+)$", d)
+            if m:
+                builds.append((m.group(1), m.group(2), int(m.group(3)), d))
+    except OSError:
+        pass
+
+    # Sort with the biggest version first
+    try:
+        # py27
+        builds.sort(lambda a, b: -cmp(a[2], b[2]))  # noqa: F821
+    except TypeError:
+        # py3
+        builds.sort(key=lambda a: a[2], reverse=True)
+
+    for nsv in local_build_nsvs:
+        parts = nsv.split(":")
+        if len(parts) < 1 or len(parts) > 3:
+            raise RuntimeError(
+                'The local build "{0}" couldn\'t be be parsed into NAME[:STREAM[:VERSION]]'
+                .format(nsv)
+            )
+
+        name = parts[0]
+        stream = parts[1] if len(parts) > 1 else None
+        version = int(parts[2]) if len(parts) > 2 else None
+
+        found_build = None
+        for build in builds:
+            if name != build[0]:
+                continue
+            if stream is not None and stream != build[1]:
+                continue
+            if version is not None and version != build[2]:
+                continue
+
+            found_build = build
+            break
+
+        if not found_build:
+            raise RuntimeError(
+                'The local build "{0}" couldn\'t be found in "{1}"'.format(
+                    nsv, conf.mock_resultsdir)
+            )
+
+        # Load the modulemd metadata.
+        path = os.path.join(conf.mock_resultsdir, found_build[3], "results")
+        mmd = load_mmd_file(os.path.join(path, "modules.yaml"))
+
+        # Create ModuleBuild in database.
+        module = models.ModuleBuild.create(
+            db_session,
+            conf,
+            name=mmd.get_module_name(),
+            stream=mmd.get_stream_name(),
+            version=str(mmd.get_version()),
+            context=mmd.get_context(),
+            modulemd=mmd_to_str(mmd),
+            scmurl="",
+            username="mbs",
+        )
+        module.koji_tag = path
+        module.state = models.BUILD_STATES["ready"]
+        db_session.commit()
+
+        if (
+            found_build[0] != module.name
+            or found_build[1] != module.stream
+            or str(found_build[2]) != module.version
+        ):
+            raise RuntimeError(
+                'Parsed metadata results for "{0}" don\'t match the directory name'.format(
+                    found_build[3])
+            )
+        log.info("Loaded local module build %r", module)
+
+
+def get_local_releasever():
+    """
+    Returns the $releasever variable used in the system when expanding .repo files.
+    """
+    dnf_base = dnf.Base()
+    return dnf_base.conf.releasever
+
+
+def import_builds_from_local_dnf_repos(platform_id=None):
+    """
+    Imports the module builds from all available local repositories to MBS DB.
+
+    This is used when building modules locally without any access to MBS infra.
+    This method also generates and imports the base module according to /etc/os-release.
+
+    :param str platform_id: The `name:stream` of a fake platform module to generate in this
+        method. When not set, the /etc/os-release is parsed to get the PLATFORM_ID.
+    """
+    log.info("Loading available RPM repositories.")
+    dnf_base = dnf.Base()
+    dnf_base.read_all_repos()
+
+    log.info("Importing available modules to MBS local database.")
+    for repo in dnf_base.repos.values():
+        try:
+            repo.load()
+        except Exception as e:
+            log.warning(str(e))
+            continue
+        mmd_data = repo.get_metadata_content("modules")
+        mmd_index = Modulemd.ModuleIndex.new()
+        ret, _ = mmd_index.update_from_string(mmd_data, True)
+        if not ret:
+            log.warning("Loading the repo '%s' failed", repo.name)
+            continue
+
+        for module_name in mmd_index.get_module_names():
+            for mmd in mmd_index.get_module(module_name).get_all_streams():
+                xmd = mmd.get_xmd()
+                xmd["mbs"] = {}
+                xmd["mbs"]["koji_tag"] = "repofile://" + repo.repofile
+                xmd["mbs"]["mse"] = True
+                xmd["mbs"]["commit"] = "unknown"
+                mmd.set_xmd(xmd)
+
+                import_mmd(db_session, mmd, False)
+
+    if not platform_id:
+        # Parse the /etc/os-release to find out the local platform:stream.
+        with open("/etc/os-release", "r") as fd:
+            for l in fd.readlines():
+                if not l.startswith("PLATFORM_ID"):
+                    continue
+                platform_id = l.split("=")[1].strip("\"' \n")
+    if not platform_id:
+        raise ValueError("Cannot get PLATFORM_ID from /etc/os-release.")
+
+    # Create the fake platform:stream:1:000000 module to fulfill the
+    # dependencies for local offline build and also to define the
+    # srpm-buildroot and buildroot.
+    import_fake_base_module("%s:1:000000" % platform_id)
 
 
 class MockModuleBuilder(GenericBuilder):
@@ -75,7 +270,7 @@ class MockModuleBuilder(GenericBuilder):
     else:
         raise IOError("None of {} yum config files found.".format(conf.yum_config_file))
 
-    @module_build_service.utils.validate_koji_tag("tag_name")
+    @validate_koji_tag("tag_name")
     def __init__(self, db_session, owner, module, config, tag_name, components):
         self.db_session = db_session
         self.module_str = module.name
@@ -84,7 +279,7 @@ class MockModuleBuilder(GenericBuilder):
         self.config = config
         self.groups = []
         self.enabled_modules = []
-        self.releasever = module_build_service.utils.get_local_releasever()
+        self.releasever = get_local_releasever()
         self.yum_conf = MockModuleBuilder.yum_config_template
         self.koji_session = None
 
@@ -317,6 +512,7 @@ class MockModuleBuilder(GenericBuilder):
         pass
 
     def buildroot_add_artifacts(self, artifacts, install=False):
+        from module_build_service.scheduler.handlers.repos import done as repos_done_handler
         self._createrepo()
 
         # TODO: This is just hack to install module-build-macros into the
@@ -329,9 +525,7 @@ class MockModuleBuilder(GenericBuilder):
                 self.groups.append("module-build-macros")
                 self._write_mock_config()
 
-        from module_build_service.scheduler.consumer import fake_repo_done_message
-
-        fake_repo_done_message(self.tag_name)
+        events.scheduler.add(repos_done_handler, ("fake_msg", self.tag_name + "-build"))
 
     def tag_artifacts(self, artifacts):
         pass
@@ -393,23 +587,18 @@ class MockModuleBuilder(GenericBuilder):
         self._write_mock_config()
 
     def _send_build_change(self, state, source, build_id):
+        from module_build_service.scheduler.handlers.components import (
+            build_task_finalize as build_task_finalize_handler)
         try:
             nvr = kobo.rpmlib.parse_nvr(source)
         except ValueError:
             nvr = {"name": source, "release": "unknown", "version": "unknown"}
 
-        # build_id=1 and task_id=1 are OK here, because we are building just
-        # one RPM at the time.
-        msg = module_build_service.messaging.KojiBuildChange(
-            msg_id="a faked internal message",
-            build_id=build_id,
-            task_id=build_id,
-            build_name=nvr["name"],
-            build_new_state=state,
-            build_release=nvr["release"],
-            build_version=nvr["version"],
-        )
-        module_build_service.scheduler.consumer.work_queue_put(msg)
+        # use build_id as task_id
+        args = (
+            "a faked internal message", build_id, state, nvr["name"], nvr["version"],
+            nvr["release"], None, None)
+        events.scheduler.add(build_task_finalize_handler, args)
 
     def _save_log(self, resultsdir, log_name, artifact_name):
         old_log = os.path.join(resultsdir, log_name)
@@ -585,7 +774,7 @@ class MockModuleBuilder(GenericBuilder):
             # Modules from local repository have already the RPMs filled in mmd.
             return mmd.get_rpm_artifacts()
         else:
-            koji_session = KojiModuleBuilder.get_session(conf, login=False)
+            koji_session = get_session(conf, login=False)
             rpms = koji_session.listTaggedRPMS(build.koji_tag, latest=True)[0]
             nvrs = set(kobo.rpmlib.make_nvr(rpm, force_epoch=True) for rpm in rpms)
             return list(nvrs)
@@ -669,7 +858,7 @@ class SCMBuilder(BaseBuilder):
         if not self.koji_session:
             # If Koji is not configured on the system, then just return 0.0 for components
             try:
-                self.koji_session = KojiModuleBuilder.get_session(self.config, login=False)
+                self.koji_session = get_session(self.config, login=False)
                 # If the component has not been built before, then None is returned. Instead,
                 # let's return 0.0 so the type is consistent
                 return self.koji_session.getAverageBuildDuration(component.package) or 0.0

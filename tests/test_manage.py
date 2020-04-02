@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
-import pytest
-from mock import patch
+from __future__ import absolute_import
 
-from module_build_service import app, models
-from module_build_service.db_session import db_session
+from mock import patch
+import pytest
+
+from module_build_service import app
+from module_build_service.common import models
+from module_build_service.common.models import BUILD_STATES, ModuleBuild
 from module_build_service.manage import manager_wrapper, retire
-from module_build_service.models import BUILD_STATES, ModuleBuild
-from module_build_service.utils.general import deps_to_dict
+from module_build_service.scheduler.db_session import db_session
+from module_build_service.web.utils import deps_to_dict
 from tests import clean_database, staged_data_filename
 
 
@@ -48,7 +51,12 @@ class TestMBSManage:
     def test_retire_build(self, prompt_bool, overrides, identifier, changed_count):
         prompt_bool.return_value = True
 
-        module_builds = db_session.query(ModuleBuild).filter_by(state=BUILD_STATES["ready"]).all()
+        module_builds = (
+            db_session.query(ModuleBuild)
+            .filter_by(state=BUILD_STATES["ready"])
+            .order_by(ModuleBuild.id.desc())
+            .all()
+        )
         # Verify our assumption of the amount of ModuleBuilds in database
         assert len(module_builds) == 3
 
@@ -65,7 +73,10 @@ class TestMBSManage:
 
         retire(identifier)
         retired_module_builds = (
-            db_session.query(ModuleBuild).filter_by(state=BUILD_STATES["garbage"]).all()
+            db_session.query(ModuleBuild)
+            .filter_by(state=BUILD_STATES["garbage"])
+            .order_by(ModuleBuild.id.desc())
+            .all()
         )
 
         assert len(retired_module_builds) == changed_count
@@ -93,7 +104,7 @@ class TestMBSManage:
         assert len(module_builds) == 3
 
         for x, build in enumerate(module_builds):
-            build.name = "spam"
+            build.name = "spam" + str(x) if x > 0 else "spam"
             build.stream = "eggs"
 
         db_session.commit()
@@ -103,7 +114,7 @@ class TestMBSManage:
             db_session.query(ModuleBuild).filter_by(state=BUILD_STATES["garbage"]).all()
         )
 
-        expected_changed_count = 3 if confirm_expected else 0
+        expected_changed_count = 1 if confirm_expected else 0
         assert len(retired_module_builds) == expected_changed_count
 
 
@@ -120,7 +131,7 @@ class TestCommandBuildModuleLocally:
 
         # The consumer is not required to run actually, so it does not make
         # sense to publish message after creating a module build.
-        self.publish_patcher = patch("module_build_service.messaging.publish")
+        self.publish_patcher = patch("module_build_service.common.messaging.publish")
         self.mock_publish = self.publish_patcher.start()
 
         # Don't allow conf.set_item call to modify conf actually inside command
@@ -149,7 +160,7 @@ class TestCommandBuildModuleLocally:
         finally:
             app.config["SQLALCHEMY_DATABASE_URI"] = original_db_uri
 
-    @patch("module_build_service.scheduler.main")
+    @patch("module_build_service.scheduler.local.main")
     def test_set_stream(self, main):
         cli_cmd = [
             "mbs-manager", "build_module_locally",
@@ -159,9 +170,9 @@ class TestCommandBuildModuleLocally:
 
         self._run_manager_wrapper(cli_cmd)
 
-        # Since module_build_service.scheduler.main is mocked, MBS does not
-        # really build the testmodule for this test. Following lines assert the
-        # fact:
+        # Since module_build_service.scheduler.local.main is mocked, MBS does
+        # not really build the testmodule for this test. Following lines assert
+        # the fact:
         # Module testmodule-local-build is expanded and stored into database,
         # and this build has buildrequires platform:f28 and requires
         # platform:f28.
@@ -201,7 +212,7 @@ class TestCommandBuildModuleLocally:
             "--file", staged_data_filename("testmodule-local-build.yaml")
         ]
 
-        def main_side_effect(initial_messages, stop_condition):
+        def main_side_effect(module_build_ids):
             build = db_session.query(models.ModuleBuild).filter(
                 models.ModuleBuild.name == "testmodule-local-build"
             ).first()
@@ -211,7 +222,7 @@ class TestCommandBuildModuleLocally:
         # We don't run consumer actually, but it could be patched to mark some
         # module build failed for test purpose.
 
-        with patch("module_build_service.scheduler.main",
+        with patch("module_build_service.scheduler.local.main",
                    side_effect=main_side_effect):
             with pytest.raises(RuntimeError, match="Module build failed"):
                 self._run_manager_wrapper(cli_cmd)

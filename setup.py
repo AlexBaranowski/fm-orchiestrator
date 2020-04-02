@@ -24,7 +24,7 @@ tests_require, _ = read_requirements(path.join(setup_py_path, "test-requirements
 setup(
     name="module-build-service",
     description="The Module Build Service for Modularity",
-    version="2.31.0",
+    version="3.0.0",
     classifiers=["Programming Language :: Python", "Topic :: Software Development :: Build Tools"],
     keywords="module build service fedora modularity koji mock rpm",
     author="The Factory 2.0 Team",
@@ -44,10 +44,9 @@ setup(
             "mbs-manager = module_build_service.manage:manager_wrapper",
         ],
         "moksha.consumer": "mbsconsumer = module_build_service.scheduler.consumer:MBSConsumer",
-        "moksha.producer": "mbspoller = module_build_service.scheduler.producer:MBSProducer",
         "mbs.messaging_backends": [
-            "fedmsg = module_build_service.messaging:_fedmsg_backend",
-            "in_memory = module_build_service.messaging:_in_memory_backend",
+            "fedmsg = module_build_service.common.messaging:_fedmsg_backend",
+            "in_memory = module_build_service.common.messaging:_in_memory_backend",
             # 'custom = your_organization:_custom_backend',
         ],
         "mbs.builder_backends": [
@@ -67,7 +66,6 @@ setup(
             "/etc/module-build-service/",
             [
                 "conf/cacert.pem",
-                "conf/config.py",
                 "conf/koji.conf",
                 "conf/mock.cfg",
                 "conf/yum.conf",

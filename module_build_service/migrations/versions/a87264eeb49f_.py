@@ -12,8 +12,8 @@ down_revision = "1817e62719f9"
 
 from alembic import op
 import sqlalchemy as sa
-from module_build_service import Modulemd
-from module_build_service.models import ModuleBuild
+from module_build_service.common.models import ModuleBuild
+from module_build_service.common.modulemd import Modulemd
 
 
 modulebuild = sa.Table(

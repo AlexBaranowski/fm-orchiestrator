@@ -1,0 +1,17 @@
+document: modulemd
+version: 1
+data:
+  summary: A test module in all its beautiful beauty
+  description: This module buildrequires a virtual stream of the platform module
+  name: testmodule
+  stream: buildrequire_virtual_stream
+  license:
+    module: [ MIT ]
+  dependencies:
+    buildrequires:
+        platform: fedora
+    requires:
+        platform: fedora
+  references:
+    community: https://docs.pagure.org/modularity/
+    documentation: https://fedoraproject.org/wiki/Fedora_Packaging_Guidelines_for_Modules

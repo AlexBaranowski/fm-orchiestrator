@@ -1,0 +1,26 @@
+---
+document: modulemd
+version: 1
+data:
+  description: Fedora 30 traditional base
+  name: platform
+  license:
+    module: [MIT]
+  profiles:
+    default:
+      rpms: [mksh]
+    buildroot:
+        rpms: foo
+    srpm-buildroot:
+        rpms: bar
+  stream: f30
+  summary: A test module in all its beautiful beauty
+  version: 3
+  context: 00000000
+  xmd:
+    mbs:
+      buildrequires: {}
+      commit: virtual
+      requires: {}
+      mse: true
+      koji_tag: module-f30-build

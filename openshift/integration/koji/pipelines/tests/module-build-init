@@ -1,0 +1,125 @@
+#!/bin/bash -ex
+
+# expected environment variables:
+# CACERT = filepath with CA cert
+# MBS_FRONTEND_HOST
+# KOJI_CONFIG = path to koji configuration
+
+# Kerberos ticket with user having permissions to build module
+
+if [ -z "$CACERT" ] || [ -z "$MBS_FRONTEND_HOST" ] || [ -z "$KOJI_CONFIG" ] || ! klist &>/dev/null ; then
+    echo "Missing environment configuration"
+    exit 1
+fi
+
+RESPONSE=$(mktemp)
+HTTP_CODE=$(mktemp)
+MODULE_REQUEST=$(mktemp)
+
+cat > $MODULE_REQUEST << EOF
+{"scmurl": "https://src.fedoraproject.org/modules/testmodule.git?#9c589780e1dd1698dc64dfa28d30014ad18cad32", "branch": "f28"}
+EOF
+
+curl -s --negotiate -u : \
+     --cacert $CACERT \
+     -H 'Content-Type: application/json' \
+     -H 'Accept: application/json' \
+     -d @$MODULE_REQUEST \
+     -o $RESPONSE \
+     -w '%{http_code}' \
+     https://${MBS_FRONTEND_HOST}/module-build-service/1/module-builds/ > $HTTP_CODE
+
+if [ "$(cat $HTTP_CODE)" != "201" ]; then
+    echo "HTTP code was $(cat $HTTP_CODE), not 201"
+    exit 1
+fi
+
+MODULE_ID=$(jq '.id' $RESPONSE)
+TEST_TARGET_TAG_INFO_FILE=$(mktemp)
+i=0
+while true; do
+    sleep 5
+    i=$((i + 1))
+    if [ $i -gt 100 ]; then
+        echo "Module build has timed out"
+        exit 1
+    fi
+    curl -s --cacert $CACERT \
+         -o $RESPONSE \
+         -w '%{stderr}%{http_code}' \
+         https://${MBS_FRONTEND_HOST}/module-build-service/1/module-builds/$MODULE_ID 2> $HTTP_CODE
+    if [ "$(cat $HTTP_CODE)" != "200" ]; then
+        echo "HTTP code was $(cat $HTTP_CODE), not 200"
+        exit 1
+    fi
+    STATE=$(jq -r '.state_name' $RESPONSE)
+    if [ "$STATE" == "failed" ]; then
+        echo "Module build failed"
+        exit 1
+    elif [ "$STATE" != "build" ]; then
+        echo "Module ${MODULE_ID} is in the $STATE state, not build"
+        continue
+    fi
+    TEST_TARGET="$(koji -c $KOJI_CONFIG -q list-targets | awk '$1~"^module-testmodule-" {print $1, $2}')"
+    if [ -z "$TEST_TARGET" ]; then
+        echo "Could not find module target"
+        continue
+    fi
+    TEST_TARGET_NAME=$(echo ${TEST_TARGET} | awk '{print $1}')
+    TEST_TARGET_BUILD_TAG=$(echo ${TEST_TARGET} | awk '{print $2}')
+    echo "Target: ${TEST_TARGET_NAME}"
+    koji -c $KOJI_CONFIG taginfo ${TEST_TARGET_BUILD_TAG} > ${TEST_TARGET_TAG_INFO_FILE}
+
+    if ! grep -q "Arches: x86_64" ${TEST_TARGET_TAG_INFO_FILE}; then
+       echo "${TEST_TARGET_BUILD_TAG} does not have arches set to x86_64"
+       continue
+    fi
+
+    if ! grep -q "Required permission: 'admin'" ${TEST_TARGET_TAG_INFO_FILE}; then
+       echo "${TEST_TARGET_BUILD_TAG} does not have perm set to admin"
+       continue
+    fi
+    if ! grep -q "  mock.package_manager : 'dnf'" ${TEST_TARGET_TAG_INFO_FILE}; then
+       echo "${TEST_TARGET_BUILD_TAG} is not configured to use dnf"
+       continue
+    fi
+    if ! grep -q "  repo_include_all : True" ${TEST_TARGET_TAG_INFO_FILE}; then
+       echo "${TEST_TARGET_BUILD_TAG} is not configured with repo_include_all"
+       continue
+    fi
+    if ! koji -c $KOJI_CONFIG list-tag-inheritance ${TEST_TARGET_BUILD_TAG} | grep -q 'module-f28-build'; then
+       echo "module-f28-build not in inheritance of  ${TEST_TARGET_BUILD_TAG}"
+       continue
+    fi
+    if [ "$(koji -c $KOJI_CONFIG list-groups ${TEST_TARGET_BUILD_TAG} | grep 'bash:\|rpm-build:\|module-build-macros:' | wc -l)" != 6 ]; then
+       echo "${TEST_TARGET_BUILD_TAG} does not have required packages in the srpm-build or build group "
+       continue
+    fi
+    BUILD_TASK=$(koji -c $KOJI_CONFIG list-tasks | grep 'build (')
+    if [ -z "${BUILD_TASK}" ]; then
+       echo "No build task has been created"
+       continue
+    fi
+    if ! echo ${BUILD_TASK} | grep -q "module-build-macros"; then
+        echo "The build task is not building module-build-macros"
+        continue
+    fi
+    if ! echo ${BUILD_TASK} | grep -q "\.src\.rpm"; then
+        echo "The build task is not building from an SRPM"
+        continue
+    fi
+
+    NEW_REPO_TASK=$(koji -c $KOJI_CONFIG list-tasks | grep 'newRepo (')
+    if [ -z "${NEW_REPO_TASK}" ]; then
+       echo "No newRepo task has been created"
+       continue
+    fi
+
+    if ! echo $NEW_REPO_TASK | grep -q ${TEST_TARGET_BUILD_TAG}; then
+       echo "The newRepo task is not associated with the correct tag"
+       continue
+    fi
+
+    echo "All tests passed"
+    break
+done
