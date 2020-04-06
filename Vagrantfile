@@ -15,7 +15,9 @@ $script = <<SCRIPT
       python3-pytest-cov \
       python3-tox \
       rpm-build \
-      sqlite
+      sqlite \
+      vim \
+      wget
     # Install the runtime dependencies from the module-build-service spec file
     curl -s https://src.fedoraproject.org/rpms/module-build-service/raw/master/f/module-build-service.spec -o /tmp/module-build-service.spec
     dnf install -y $(rpmspec --parse /tmp/module-build-service.spec  | grep ^Requires: | tr -s ' ' | cut -d ' ' -f2)
@@ -41,6 +43,8 @@ $make_devenv = <<DEVENV
       # Go to working directory after login
       echo "cd $code_dir" >> ~/.bashrc
   fi
+  echo -e "config_opts['macros']['%vendor'] = 'EuroLinux'\nconfig_opts['macros']['%packager'] = 'EuroLinux'" | sudo tee /etc/mock/site-defaults.cfg
+
 DEVENV
 
 $config_pgsql = <<PGSQL
@@ -94,7 +98,7 @@ Vagrant.configure("2") do |config|
   config.vm.provision "shell", inline: $make_devenv, privileged: false
   # 4096 and 4 cpu should be enough to build most packages
   config.vm.provider "libvirt" do |v, override|
-    v.memory = 4096
-    v.cpus = 4
+    v.memory = 10240
+    v.cpus = 6
   end
 end
