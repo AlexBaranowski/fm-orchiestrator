@@ -96,7 +96,7 @@ Vagrant.configure("2") do |config|
   config.vm.provision "shell", inline: "usermod -a -G mock vagrant"
   config.vm.provision "shell", inline: $config_pgsql
   config.vm.provision "shell", inline: $make_devenv, privileged: false
-  # 4096 and 4 cpu should be enough to build most packages
+  # 10240 and 6 cpu should be enough to build all packages
   config.vm.provider "libvirt" do |v, override|
     v.memory = 10240
     v.cpus = 6
